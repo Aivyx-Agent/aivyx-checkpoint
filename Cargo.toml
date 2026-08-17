@@ -1,0 +1,15 @@
+[package]
+name = "aivyx-checkpoint"
+description = "Git-ref checkpoint/rollback for agent tool calls: snapshot a worktree to a shadow ref before a mutating call, restore it on demand, without touching the user's HEAD, index, or worktree"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+tokio = { version = "1.52.3", features = ["process", "time", "macros"] }
+tokio-util = "0.7.18"
+tracing = "0.1.44"
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.52.3", features = ["macros", "rt"] }
