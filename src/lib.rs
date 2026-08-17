@@ -309,7 +309,10 @@ pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result
 /// even under `cargo test` there — and this module has consumers in
 /// exactly that position (`aivyx-coder`'s `aivyx-tools` crate). `pub` for
 /// the same cross-crate reason; `#[doc(hidden)]` because it's a shared
-/// test fixture, not part of this crate's real API surface.
+/// test fixture, not part of this crate's real API surface. `init_repo`
+/// builds a repo with one committed `tracked.txt` on `main`, with a
+/// repo-local identity so tests don't depend on the machine's global git
+/// config.
 #[doc(hidden)]
 pub mod test_support {
     use super::run_git;
