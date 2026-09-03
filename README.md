@@ -33,9 +33,12 @@ can use them) are both exported for direct reuse — `aivyx-coder`'s own
 
 Extracted 2026-08-18 from `aivyx-coder`'s own `aivyx-tools` crate, which
 now depends on this crate instead of maintaining its own copy (see that
-repo's `CLAUDE.md` for the migration). `aivyx` (the flagship Personal
-Assistant) does not yet adopt this crate — that integration is separate,
-explicit follow-on work, not assumed here.
+repo's `CLAUDE.md` for the migration). **`aivyx` (the flagship Personal
+Assistant) adopted this crate 2026-08-18/19**, extended to every real
+`ConcreteAgent` construction site (9 of 9, except one singular-session
+function with zero production callers) by 2026-08-20 — `fs.write`/
+`fs.delete`/`shell.exec`, `git.commit`, and `workspace.*` all checkpoint
+through it today. Both consumers now depend on this crate.
 
 See `docs/superpowers/specs/2026-08-18-aivyx-checkpoint-design.md` in the
 `aivyx-ecosystem` repo for the full design rationale.

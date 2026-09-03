@@ -18,8 +18,11 @@ for the full rationale — this file only covers what's specific to working
 in this repo's code.
 
 `aivyx-coder`'s own `aivyx-tools` crate depends on this crate today
-(migrated 2026-08-18). `aivyx` does not yet — that integration is
-separate follow-on work, tracked outside this repo.
+(migrated 2026-08-18). **`aivyx` also depends on this crate**, adopted
+2026-08-18/19 and extended to every real `ConcreteAgent` construction
+site by 2026-08-20 (`fs.write`/`fs.delete`/`shell.exec`, `git.commit`,
+`workspace.*` all checkpoint through it). Both real consumers now
+depend on this crate.
 
 ## Build, test, lint
 
@@ -69,7 +72,9 @@ objects become unreferenced and age out via normal `git gc`.
 
 - `README.md` — quick orientation and the design-doc pointer.
 - `aivyx-ecosystem/docs/superpowers/specs/2026-08-18-aivyx-checkpoint-design.md`
-  — the full design: why this was extracted, why `aivyx-coder`'s migration
-  is part of the same project (unlike `aivyx-recall`/`aivyx-kvcache`,
-  which shipped standalone with no consumer yet), and `aivyx`'s adoption
-  as explicit deferred follow-on.
+  — the full design: why this was extracted, and why `aivyx-coder`'s
+  migration was part of the same project (unlike `aivyx-recall`/
+  `aivyx-kvcache`, which shipped standalone with no consumer yet).
+  `aivyx`'s own adoption (2026-08-18/19, extended 2026-08-20) has its
+  own design docs in that repo — see `aivyx-ecosystem/ROADMAP.md`'s
+  `aivyx-checkpoint` entry.
