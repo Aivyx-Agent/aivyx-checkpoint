@@ -1,5 +1,8 @@
 # aivyx-checkpoint
 
+[![CI](https://github.com/Aivyx-Agent/aivyx-checkpoint/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/Aivyx-Agent/aivyx-checkpoint/actions/workflows/ci.yml)
+[![License: Apache-2.0 OR MIT](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](LICENSE)
+
 Git-ref checkpoint/rollback for agent tool calls.
 
 `GitCheckpointer::detect(cwd, deny_paths)` builds a checkpointer for a
