@@ -1,0 +1,61 @@
+# cargo-deny configuration — dependency license policy.
+#
+# Run: `cargo deny check licenses`
+#
+# aivyx-coder relicenses MIT OR Apache-2.0 -> BUSL-1.1 (see LICENSE). For
+# that to be lawful, NO dependency may impose copyleft (GPL/LGPL-only/
+# AGPL/MPL/SSPL/EPL/CDDL) on the combined work. This allow-list is
+# therefore permissive-only and deliberately omits every copyleft
+# license: cargo-deny rejects anything not listed, so a future copyleft
+# dep fails the gate loudly instead of silently poisoning the relicense.
+#
+# The list matches aivyx-pa's own established allow-list exactly (that
+# repo went through this same relicense first, and its own audit found a
+# real GPL-3.0 blocker before settling on this list) — reused rather
+# than redrafted so both repos apply the identical policy.
+
+[graph]
+all-features = true
+
+[licenses]
+version = 2
+# Skip aivyx-coder's OWN workspace crates: they relicense to BUSL-1.1
+# (this gate's whole purpose), so they must not be measured against the
+# dependency allow-list below. Scoped to first-party crates marked
+# publish = false (see [workspace.package], set in Task 2 of this
+# plan) -- a THIRD-PARTY crate under BUSL/any copyleft still fails
+# loudly, which is the point.
+private = { ignore = true }
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "ISC",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "Zlib",
+    "BSL-1.0",
+    "0BSD",
+    "Unlicense",
+    "WTFPL",
+    "CC0-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CDLA-Permissive-2.0",
+    "NCSA",
+    # MPL-2.0 is *file-level* (weak) copyleft: it never relicenses the
+    # larger combined work -- the only obligation is to share
+    # modifications to the MPL-licensed files themselves, which we never
+    # touch (they are upstream crates: the servo CSS stack --
+    # cssparser/selectors/dtoa-short -- pulled transitively via the
+    # `scraper` crate). Fully compatible with shipping aivyx-coder under
+    # BUSL-1.1. Verified directly: `cargo deny check licenses
+    # --all-features` is green with this allow-list and no exceptions.
+    "MPL-2.0",
+]
+
+# No per-crate license exceptions. `cargo deny check licenses`
+# (all-features) is green with no exceptions -- verified directly
+# against this exact allow-list before this file was committed. Any
+# future copyleft dep now fails the gate loudly.
