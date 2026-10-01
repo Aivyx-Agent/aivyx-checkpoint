@@ -273,9 +273,16 @@ pub fn exclude_pathspecs(cwd: &Path, deny_paths: &[PathBuf]) -> Vec<String> {
 /// timeout bound it instead. `pub` because it has a consumer beyond this
 /// file: `aivyx-coder`'s own `wiki.rs` module calls this directly,
 /// cross-crate, for its own (unrelated) git plumbing needs.
+///
+/// Because it is unconfined, it never runs a program the repository's own
+/// config names: `core.fsmonitor` is forced off (it would otherwise run on
+/// `add`/`status`). Filters and diff drivers are left alone — they need a
+/// config entry, and callers keep `.git/config` and the global git config
+/// out of the agent's reach.
 pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
     let mut command = tokio::process::Command::new("git");
     command
+        .args(["-c", "core.fsmonitor=false"])
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -439,6 +446,27 @@ mod tests {
             !tree.contains("secret"),
             "denied subtree leaked into snapshot: {tree}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_repo_configured_fsmonitor_never_runs() {
+        // `.git/config` can name a program for git to run (core.fsmonitor);
+        // checkpoints run unconfined, so they must not run it.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let marker = dir.path().join("fsmonitor-ran");
+        let hook = format!("sh -c 'touch {}; exit 1' --", marker.display());
+        run_git(dir.path(), &["config", "core.fsmonitor", &hook], &[])
+            .await
+            .unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "modified\n").unwrap();
+
+        let cwd = dir.path().canonicalize().unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+
+        assert_eq!(checkpoint_refs(dir.path()).await.len(), 1);
+        assert!(!marker.exists(), "a checkpoint ran the repo's fsmonitor");
     }
 
     #[tokio::test]
