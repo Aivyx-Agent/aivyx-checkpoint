@@ -279,50 +279,36 @@ const SAFE_GIT_CONFIG: [&str; 6] = [
     "commit.gpgSign=false",
 ];
 
-/// `-c` overrides that switch off every filter driver defined in the
-/// *repository's own* config (`.git/config`, its includes, and a
-/// worktree's `config.worktree`) — the config a confined process can write,
-/// since `.git` sits inside the directory it may write under. A clean,
-/// smudge or process filter there would otherwise run with this crate's
-/// unconfined privileges on `add`/`read-tree`. Filters from the user's own
-/// global or system config (git-lfs, say) are trusted and left alone.
-/// Reading config runs nothing.
-async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String> {
+/// The `git config` query listing filter drivers defined in the
+/// repository's own config for one scope (`--local` / `--worktree`).
+const REPO_FILTER_QUERY: [&str; 5] = [
+    "config",
+    "--includes",
+    "--name-only",
+    "--get-regexp",
+    r"^filter\..+\.(clean|smudge|process)$",
+];
+
+fn repo_filter_query(scope: &'static str) -> Vec<&'static str> {
+    let mut args: Vec<&str> = SAFE_GIT_CONFIG.to_vec();
+    args.push(REPO_FILTER_QUERY[0]);
+    args.push(scope);
+    args.extend(&REPO_FILTER_QUERY[1..]);
+    args
+}
+
+/// `-c` overrides switching off every filter driver whose keys appear in
+/// `listings` (the output of [`repo_filter_query`], one listing per scope).
+fn filter_overrides<'a>(listings: impl IntoIterator<Item = &'a str>) -> Vec<String> {
     let mut drivers: Vec<String> = Vec::new();
-    for scope in ["--local", "--worktree"] {
-        let mut command = tokio::process::Command::new("git");
-        command
-            .args(SAFE_GIT_CONFIG)
-            .args([
-                "config",
-                scope,
-                "--includes",
-                "--name-only",
-                "--get-regexp",
-                r"^filter\..+\.(clean|smudge|process)$",
-            ])
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
-            .kill_on_drop(true);
-        for (key, value) in envs {
-            command.env(key, value);
-        }
-        // Exit 1 = no such keys; any other failure (not a repository, no
-        // worktree config) likewise means nothing to switch off.
-        let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await else {
-            continue;
-        };
-        for key in String::from_utf8_lossy(&output.stdout).lines() {
-            if let Some(driver) = key
-                .strip_prefix("filter.")
-                .and_then(|rest| rest.rsplit_once('.'))
-                .map(|(driver, _)| driver.to_string())
-                && !drivers.contains(&driver)
-            {
-                drivers.push(driver);
-            }
+    for key in listings.into_iter().flat_map(str::lines) {
+        if let Some(driver) = key
+            .strip_prefix("filter.")
+            .and_then(|rest| rest.rsplit_once('.'))
+            .map(|(driver, _)| driver.to_string())
+            && !drivers.contains(&driver)
+        {
+            drivers.push(driver);
         }
     }
     drivers
@@ -335,6 +321,60 @@ async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String
         })
         .flat_map(|setting| ["-c".to_string(), setting])
         .collect()
+}
+
+/// `-c` overrides that switch off every filter driver defined in the
+/// *repository's own* config (`.git/config`, its includes, and a
+/// worktree's `config.worktree`) — the config a confined process can write,
+/// since `.git` sits inside the directory it may write under. A clean,
+/// smudge or process filter there would otherwise run with this crate's
+/// unconfined privileges on `add`/`read-tree`. Filters from the user's own
+/// global or system config (git-lfs, say) are trusted and left alone.
+/// Reading config runs nothing; a failed query (not a repository, no
+/// worktree config, no such keys) means nothing to switch off.
+async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String> {
+    let mut listings = Vec::new();
+    for scope in ["--local", "--worktree"] {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .args(repo_filter_query(scope))
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        if let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await {
+            listings.push(String::from_utf8_lossy(&output.stdout).into_owned());
+        }
+    }
+    filter_overrides(listings.iter().map(String::as_str))
+}
+
+/// The arguments to put before the subcommand of any *blocking*, unconfined
+/// git a caller spawns itself (a preview, a branch-name lookup): the same
+/// protections [`run_git`] applies — no fsmonitor, hooks or signing, and the
+/// repository's own filter drivers switched off. Diff callers still add
+/// `--no-ext-diff --no-textconv` to the diff itself.
+pub fn unconfined_git_args_blocking(cwd: &Path) -> Vec<String> {
+    let mut args: Vec<String> = SAFE_GIT_CONFIG.iter().map(|s| s.to_string()).collect();
+    let listings: Vec<String> = ["--local", "--worktree"]
+        .into_iter()
+        .filter_map(|scope| {
+            std::process::Command::new("git")
+                .args(repo_filter_query(scope))
+                .current_dir(cwd)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        })
+        .collect();
+    args.extend(filter_overrides(listings.iter().map(String::as_str)));
+    args
 }
 
 /// One plumbing invocation:/// One plumbing invocation: trusted fixed argv (never model-controlled),
@@ -563,6 +603,41 @@ mod tests {
         assert!(!clean.exists(), "a repo clean filter ran unconfined");
         assert!(!smudge.exists(), "a repo smudge filter ran unconfined");
         assert!(!reftx.exists(), "a repo hook ran unconfined");
+    }
+
+    #[test]
+    fn filter_overrides_switch_off_every_listed_driver_once() {
+        let local = "filter.evil.clean\nfilter.evil.smudge\nfilter.with.dots.process\n";
+        let worktree = "filter.evil.clean\n";
+        let args = filter_overrides([local, worktree]);
+        let settings: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
+        assert_eq!(
+            settings,
+            vec![
+                "filter.evil.clean=",
+                "filter.evil.smudge=",
+                "filter.evil.process=",
+                "filter.evil.required=false",
+                "filter.with.dots.clean=",
+                "filter.with.dots.smudge=",
+                "filter.with.dots.process=",
+                "filter.with.dots.required=false",
+            ]
+        );
+        assert!(args.iter().step_by(2).all(|a| a == "-c"));
+        assert!(filter_overrides([""]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn blocking_args_cover_a_repo_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        run_git(&cwd, &["config", "filter.evil.clean", "touch x"], &[]).await.unwrap();
+        let args = unconfined_git_args_blocking(&cwd);
+        for needed in ["core.fsmonitor=false", "core.hooksPath=/dev/null", "filter.evil.clean="] {
+            assert!(args.iter().any(|a| a == needed), "{needed} missing from {args:?}");
+        }
     }
 
     #[tokio::test]
