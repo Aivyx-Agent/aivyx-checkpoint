@@ -268,21 +268,94 @@ pub fn exclude_pathspecs(cwd: &Path, deny_paths: &[PathBuf]) -> Vec<String> {
         .collect()
 }
 
-/// One plumbing invocation: trusted fixed argv (never model-controlled),
+/// Always passed to unconfined git: no fsmonitor, no hooks (plumbing like
+/// `update-ref` runs `reference-transaction`), no commit signing.
+const SAFE_GIT_CONFIG: [&str; 6] = [
+    "-c",
+    "core.fsmonitor=false",
+    "-c",
+    "core.hooksPath=/dev/null",
+    "-c",
+    "commit.gpgSign=false",
+];
+
+/// `-c` overrides that switch off every filter driver defined in the
+/// *repository's own* config (`.git/config`, its includes, and a
+/// worktree's `config.worktree`) — the config a confined process can write,
+/// since `.git` sits inside the directory it may write under. A clean,
+/// smudge or process filter there would otherwise run with this crate's
+/// unconfined privileges on `add`/`read-tree`. Filters from the user's own
+/// global or system config (git-lfs, say) are trusted and left alone.
+/// Reading config runs nothing.
+async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String> {
+    let mut drivers: Vec<String> = Vec::new();
+    for scope in ["--local", "--worktree"] {
+        let mut command = tokio::process::Command::new("git");
+        command
+            .args(SAFE_GIT_CONFIG)
+            .args([
+                "config",
+                scope,
+                "--includes",
+                "--name-only",
+                "--get-regexp",
+                r"^filter\..+\.(clean|smudge|process)$",
+            ])
+            .current_dir(cwd)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .kill_on_drop(true);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        // Exit 1 = no such keys; any other failure (not a repository, no
+        // worktree config) likewise means nothing to switch off.
+        let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await else {
+            continue;
+        };
+        for key in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(driver) = key
+                .strip_prefix("filter.")
+                .and_then(|rest| rest.rsplit_once('.'))
+                .map(|(driver, _)| driver.to_string())
+                && !drivers.contains(&driver)
+            {
+                drivers.push(driver);
+            }
+        }
+    }
+    drivers
+        .iter()
+        .flat_map(|driver| {
+            ["clean", "smudge", "process"]
+                .into_iter()
+                .map(move |kind| format!("filter.{driver}.{kind}="))
+                .chain(std::iter::once(format!("filter.{driver}.required=false")))
+        })
+        .flat_map(|setting| ["-c".to_string(), setting])
+        .collect()
+}
+
+/// One plumbing invocation:/// One plumbing invocation: trusted fixed argv (never model-controlled),
 /// writing only under `.git`, so it runs unconfined; `kill_on_drop` +
 /// timeout bound it instead. `pub` because it has a consumer beyond this
 /// file: `aivyx-coder`'s own `wiki.rs` module calls this directly,
 /// cross-crate, for its own (unrelated) git plumbing needs.
 ///
 /// Because it is unconfined, it never runs a program the repository's own
-/// config names: `core.fsmonitor` is forced off (it would otherwise run on
-/// `add`/`status`). Filters and diff drivers are left alone — they need a
-/// config entry, and callers keep `.git/config` and the global git config
-/// out of the agent's reach.
+/// config names — a confined process can write `.git/config`, `.git/hooks`
+/// and `.gitattributes`, since `.git` lies inside the directory it may write
+/// under. So fsmonitor and hooks are off, commit signing is off, and every
+/// filter driver defined in the repository's own config is switched off
+/// (see [`repo_program_overrides`]). Diff drivers only run for diffs:
+/// callers that diff pass `--no-ext-diff --no-textconv` themselves.
 pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
+    let neutralise = repo_program_overrides(cwd, envs).await;
     let mut command = tokio::process::Command::new("git");
     command
-        .args(["-c", "core.fsmonitor=false"])
+        .args(SAFE_GIT_CONFIG)
+        .args(&neutralise)
         .args(args)
         .current_dir(cwd)
         .stdin(std::process::Stdio::null())
@@ -446,6 +519,67 @@ mod tests {
             !tree.contains("secret"),
             "denied subtree leaked into snapshot: {tree}"
         );
+    }
+
+    /// A marker-writing script, and a shell snippet that runs it.
+    fn marker_script(dir: &Path, name: &str) -> (PathBuf, String) {
+        let marker = dir.join(format!("{name}-ran"));
+        (marker.clone(), format!("sh -c 'touch {}; cat'", marker.display()))
+    }
+
+    #[tokio::test]
+    async fn repo_configured_filters_and_hooks_never_run_unconfined() {
+        // What a confined process could plant by writing .git/config,
+        // .git/hooks or .gitattributes: none of it may run in the
+        // checkpointer's unconfined git, on checkpoint or on restore.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let marks = tempfile::tempdir().unwrap();
+        let (clean, clean_cmd) = marker_script(marks.path(), "clean");
+        let (smudge, smudge_cmd) = marker_script(marks.path(), "smudge");
+        run_git(&cwd, &["config", "filter.evil.clean", &clean_cmd], &[]).await.unwrap();
+        run_git(&cwd, &["config", "filter.evil.smudge", &smudge_cmd], &[]).await.unwrap();
+        std::fs::write(cwd.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+        let hook = cwd.join(".git/hooks/reference-transaction");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        let reftx = marks.path().join("reftx-ran");
+        std::fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", reftx.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let refs = checkpoint_refs(&cwd).await;
+        assert_eq!(refs.len(), 1, "the checkpoint itself still works");
+        std::fs::write(cwd.join("tracked.txt"), "later\n").unwrap();
+        cp.restore_to(&refs[0], &CancellationToken::new()).await.unwrap();
+        assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "changed\n");
+
+        assert!(!clean.exists(), "a repo clean filter ran unconfined");
+        assert!(!smudge.exists(), "a repo smudge filter ran unconfined");
+        assert!(!reftx.exists(), "a repo hook ran unconfined");
+    }
+
+    #[tokio::test]
+    async fn a_global_filter_still_applies() {
+        // Filters from the user's own (global) config — git-lfs, say — sit
+        // outside anything a confined process can write and keep working.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let global = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(global.path(), "[filter \"upper\"]\n\tclean = tr a-z A-Z\n").unwrap();
+        std::fs::write(cwd.join(".gitattributes"), "*.txt filter=upper\n").unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "shout\n").unwrap();
+        let env = [("GIT_CONFIG_GLOBAL", global.path().to_str().unwrap())];
+        run_git(&cwd, &["add", "tracked.txt"], &env).await.unwrap();
+        let staged = run_git(&cwd, &["show", ":tracked.txt"], &env).await.unwrap();
+        assert_eq!(staged, "SHOUT\n");
     }
 
     #[tokio::test]
