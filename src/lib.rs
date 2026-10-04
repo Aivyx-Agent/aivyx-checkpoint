@@ -159,14 +159,18 @@ impl GitCheckpointer {
         // across processes: `seq` alone starts at 0 in every process (each
         // has its own `GitCheckpointer`), so two processes checkpointing
         // the same repo within the same millisecond used to mint the exact
-        // same ref name and clobber each other's ref.
+        // same ref name and clobber each other's ref. `pid` is zero-padded
+        // to a fixed width too, for the same reason millis is: two refs
+        // sharing a millisecond must still compare consistently regardless
+        // of how many digits either pid happens to have (unpadded, pid 9
+        // would sort after pid 10 lexically, even though 9 < 10).
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis();
         let pid = std::process::id();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{pid}-{seq:04}");
+        let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{pid:07}-{seq:04}");
         let update_args: Vec<String> = vec!["update-ref".into(), ref_name.clone(), commit];
         self.git(&update_args, &[], cancellation).await?;
         tracing::info!(tool = %tool_name, r#ref = %ref_name, "worktree checkpoint saved");
@@ -361,25 +365,6 @@ const REPO_FILTER_QUERY: [&str; 5] = [
     r"^filter\..+\.(clean|smudge|process)$",
 ];
 
-/// True when `cwd` or any ancestor contains a `.git` entry — mirroring
-/// git's own repository discovery, without invoking git (which would
-/// recurse back into [`repo_program_overrides`], the only caller). A `.git`
-/// entry can be a directory (the normal case) or a file (a linked worktree
-/// or submodule's gitdir pointer) — `exists()` covers either, and reading
-/// it to resolve where it actually points isn't needed here: all this
-/// answers is "does a repository exist to query", not "where exactly is
-/// it".
-fn finds_a_repository(cwd: &Path) -> bool {
-    let mut dir = Some(cwd);
-    while let Some(d) = dir {
-        if d.join(".git").exists() {
-            return true;
-        }
-        dir = d.parent();
-    }
-    false
-}
-
 fn repo_filter_query(scope: &'static str) -> Vec<&'static str> {
     let mut args: Vec<&str> = SAFE_GIT_CONFIG.to_vec();
     args.push(REPO_FILTER_QUERY[0]);
@@ -424,24 +409,27 @@ fn filter_overrides<'a>(listings: impl IntoIterator<Item = &'a str>) -> Vec<Stri
 /// Reading config runs nothing; a query that finds no matching keys (exit
 /// status 1 — `--get-regexp`'s documented "not found" status, the normal
 /// case for a repository with no filters configured) means nothing to
-/// switch off for that scope. Any other failure — a malformed or unreadable
-/// config file, the query timing out, failing to spawn `git` at all — is a
-/// real error and is returned as one rather than silently treated the same
-/// as "no filters": this is the query that decides whether a repo-defined
-/// filter driver gets neutralised before running with this crate's
-/// unconfined privileges, so continuing with no overrides when the query
-/// itself couldn't be trusted would risk running one unneutralised.
+/// switch off for that scope, and neither does a query that finds no
+/// repository at all to query — the bootstrapping case, e.g.
+/// `GitCheckpointer::detect`'s own first probe, or a `git init` call that's
+/// about to create one, as `test_support::init_repo` makes first. git
+/// reports that case with a specific, stable fatal message for each scope's
+/// own flag (`"--local can only be used inside a git repository"` /
+/// `"--worktree can only be used inside a git repository"`), checked
+/// directly against *this* query's own result rather than via a separate
+/// pre-check — deciding "is cwd inside a repository" any other way (e.g.
+/// walking `cwd`'s ancestors for a `.git` entry) would miss `GIT_DIR`/
+/// `GIT_WORK_TREE`, which git itself honours and which `envs` (or the
+/// ambient process environment, inherited by the spawned command either
+/// way) can set to point at a repository nowhere in `cwd`'s own ancestry.
+/// Any other failure — a malformed or unreadable config file, the query
+/// timing out, failing to spawn `git` at all — is a real error and is
+/// returned as one rather than silently treated the same as "no filters":
+/// this is the query that decides whether a repo-defined filter driver gets
+/// neutralised before running with this crate's unconfined privileges, so
+/// continuing with no overrides when the query itself couldn't be trusted
+/// would risk running one unneutralised.
 async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec<String>, String> {
-    // No repository anywhere in `cwd`'s ancestry (the bootstrapping case —
-    // `GitCheckpointer::detect`'s own first probe, or a `git init` call
-    // that's about to create one, as `test_support::init_repo` makes
-    // first) means there's no repo-local config to query at all, which is
-    // an entirely different, benign situation from a repository that
-    // exists but whose config this crate's query below fails to read —
-    // only the latter is the real error this function now surfaces.
-    if !finds_a_repository(cwd) {
-        return Ok(Vec::new());
-    }
     let mut listings = Vec::new();
     for scope in ["--local", "--worktree"] {
         let mut command = tokio::process::Command::new("git");
@@ -462,10 +450,15 @@ async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec
         if output.status.success() {
             listings.push(String::from_utf8_lossy(&output.stdout).into_owned());
         } else if output.status.code() != Some(1) {
-            return Err(format!(
-                "git config --get-regexp ({scope}) failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
-            ));
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let no_repository_here =
+                stderr.contains(&format!("{scope} can only be used inside a git repository"));
+            if !no_repository_here {
+                return Err(format!(
+                    "git config --get-regexp ({scope}) failed: {}",
+                    stderr.trim()
+                ));
+            }
         }
     }
     Ok(filter_overrides(listings.iter().map(String::as_str)))
@@ -1011,6 +1004,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn git_dir_env_still_gets_its_overrides_with_no_dotgit_ancestor_in_cwd() {
+        // Regression guard: GIT_DIR (inherited by the spawned `git` process
+        // exactly like any other env var) lets a caller point git at a
+        // repository that isn't anywhere in `cwd`'s own ancestry. The old
+        // ancestor-walk pre-check (`finds_a_repository`) didn't know about
+        // this and would skip querying — and therefore neutralising —
+        // that repository's own filters entirely.
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let repo_dir = repo.path().canonicalize().unwrap();
+        run_git(
+            &repo_dir,
+            &["config", "filter.evil.clean", "touch should-not-run"],
+            &[],
+        )
+        .await
+        .unwrap();
+        let git_dir = repo_dir.join(".git");
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = elsewhere.path().canonicalize().unwrap();
+        assert!(
+            !cwd.join(".git").exists(),
+            "sanity check: cwd must have no .git of its own"
+        );
+
+        let envs = [("GIT_DIR", git_dir.to_str().unwrap())];
+        let overrides = repo_program_overrides(&cwd, &envs).await.unwrap();
+        assert!(
+            overrides.iter().any(|a| a == "filter.evil.clean="),
+            "GIT_DIR's own repo-configured filter must still be neutralised: {overrides:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn git_dir_env_with_unreadable_config_still_surfaces_as_an_error() {
+        let repo = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let repo_dir = repo.path().canonicalize().unwrap();
+        let config = repo_dir.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[bad\n");
+        std::fs::write(&config, contents).unwrap();
+        let git_dir = repo_dir.join(".git");
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let cwd = elsewhere.path().canonicalize().unwrap();
+
+        let envs = [("GIT_DIR", git_dir.to_str().unwrap())];
+        let result = repo_program_overrides(&cwd, &envs).await;
+        assert!(
+            result.is_err(),
+            "a malformed config reached only via GIT_DIR must still surface as an error"
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ref_names_pad_the_pid_to_a_fixed_width() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+
+        let refs = checkpoint_refs(dir.path()).await;
+        assert_eq!(refs.len(), 1);
+        let pid_field = refs[0]
+            .rsplit('/')
+            .next()
+            .unwrap()
+            .split('-')
+            .nth(1)
+            .expect("ref name must have a pid field");
+        assert_eq!(
+            pid_field,
+            format!("{:07}", std::process::id()),
+            "pid field must be zero-padded to a fixed width: {}",
+            refs[0]
+        );
+    }
+
+    #[tokio::test]
     async fn checkpoint_ref_names_include_the_process_id() {
         // Regression guard: two checkpointer instances (standing in for two
         // separate processes sharing one repo) both start their own `seq`
@@ -1032,23 +1106,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn old_format_refs_are_still_listed_and_pruned_alongside_new_ones() {
+    async fn ref_names_from_every_historical_format_still_list_and_prune_together() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).await;
         let cwd = dir.path().canonicalize().unwrap();
+        let head = run_git(&cwd, &["rev-parse", "HEAD"], &[]).await.unwrap();
+        let head = head.trim();
 
-        // Simulate a ref created by a pre-pid build: `{millis}-{seq}`, no
-        // pid component, comfortably older than anything made below.
-        let old_millis = std::time::SystemTime::now()
+        // Three ref shapes this crate has produced, oldest to newest:
+        // no pid at all, an unpadded pid (this fix's own immediately
+        // preceding format), and — what `checkpoint` mints today — a
+        // zero-padded pid. All three must sort, list, and prune together.
+        // Comfortably older than anything `checkpoint` mints below.
+        let base_millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis()
-            - 10_000;
-        let old_ref = format!("refs/aivyx/checkpoints/{old_millis:013}-0000");
-        let head = run_git(&cwd, &["rev-parse", "HEAD"], &[]).await.unwrap();
-        run_git(&cwd, &["update-ref", &old_ref, head.trim()], &[])
-            .await
-            .unwrap();
+            - 20_000;
+        let no_pid_ref = format!("refs/aivyx/checkpoints/{base_millis:013}-0000");
+        let unpadded_pid_ref = format!("refs/aivyx/checkpoints/{:013}-42-0000", base_millis + 1);
+        for r in [&no_pid_ref, &unpadded_pid_ref] {
+            run_git(&cwd, &["update-ref", r, head], &[]).await.unwrap();
+        }
 
         let mut cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
         cp.set_retain(2);
@@ -1061,11 +1140,11 @@ mod tests {
         assert_eq!(
             refs.len(),
             2,
-            "retention must still cap total refs with an old-format ref mixed in: {refs:?}"
+            "retention must still cap total refs with older-format refs mixed in: {refs:?}"
         );
         assert!(
-            !refs.contains(&old_ref),
-            "the oldest ref (old format) should have been pruned first: {refs:?}"
+            !refs.contains(&no_pid_ref) && !refs.contains(&unpadded_pid_ref),
+            "the two oldest refs (older formats) should have been pruned first: {refs:?}"
         );
     }
 

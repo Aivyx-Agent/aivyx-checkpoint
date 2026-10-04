@@ -61,19 +61,23 @@ Single file, `lib.rs`:
 
 ### Checkpoint ref naming and retention
 
-`refs/aivyx/checkpoints/{millis:013}-{pid}-{seq:04}` — zero-padded millis
-sorts lexically == chronologically, which both `prune` (retention cutoff)
-and `latest_ref` (`.rfind`) rely on; the pid comes right after it
-specifically so it never disturbs that ordering. `pid` disambiguates
-checkpoints minted by two different processes sharing a repo within the
-same millisecond — `seq` alone can't, since each process's `GitCheckpointer`
-starts its own `seq` at 0. Refs written before the pid was added
-(`{millis}-{seq}`, no pid segment) still list and prune correctly: neither
-function parses the ref name beyond treating the whole thing as one
-lexically-sortable string. `RETAIN` (default 50) is the number kept;
-`prune` runs after every successful checkpoint and deletes the oldest refs
-beyond that count — deleting the ref is enough, the underlying commit/tree
-objects become unreferenced and age out via normal `git gc`.
+`refs/aivyx/checkpoints/{millis:013}-{pid:07}-{seq:04}` — zero-padded
+millis sorts lexically == chronologically, which both `prune` (retention
+cutoff) and `latest_ref` (`.rfind`) rely on; the pid comes right after it
+and is zero-padded the same way, for the same reason: two refs sharing a
+millisecond must still compare consistently regardless of how many digits
+either value happens to have. `pid` disambiguates checkpoints minted by two
+different processes sharing a repo within the same millisecond — `seq`
+alone can't, since each process's `GitCheckpointer` starts its own `seq` at
+0. Refs in either older format this crate has produced — no pid segment at
+all (`{millis}-{seq}`), or an unpadded pid (`{millis}-{pid}-{seq}`, this
+fix's own immediately preceding format) — still list and prune correctly
+alongside the current one: neither function parses the ref name beyond
+treating the whole thing as one lexically-sortable string. `RETAIN`
+(default 50) is the number kept; `prune` runs after every successful
+checkpoint and deletes the oldest refs beyond that count — deleting the ref
+is enough, the underlying commit/tree objects become unreferenced and age
+out via normal `git gc`.
 
 ### Private-index lock and config-query reliability
 
@@ -88,18 +92,24 @@ own best-effort contract swallows the error).
 
 `run_git` neutralises repo-configured filter drivers before every
 invocation (`repo_program_overrides`) by querying `git config
---local`/`--worktree` for them first. That query's own failure is split
-three ways: no repository anywhere in `cwd`'s ancestry (`finds_a_repository`
-— the bootstrapping case, e.g. `GitCheckpointer::detect`'s first probe or
-`test_support::init_repo`'s `git init` call) skips the query entirely and
-proceeds with no overrides, since there's nothing to query yet; exit status
-1 (`--get-regexp`'s "no matching key") means a real repo with no filters
-configured, also not an error; anything else (a malformed or unreadable
-local config, the query timing out) is a real failure and now propagates
-as an `Err` from `run_git` itself, rather than being silently treated the
-same as "no filters to neutralise" — the previous behavior, which risked
-running a repo-configured filter unconfined if the query meant to detect it
-had itself failed to read.
+--local`/`--worktree` for them first, directly against `cwd`+`envs` (so
+`GIT_DIR`/`GIT_WORK_TREE` — which git itself honours and which `envs` or
+the ambient environment can set to point at a repository nowhere in
+`cwd`'s own ancestry — are respected the same way the real git invocation
+right after it respects them; there's deliberately no separate "is this a
+repository" pre-check based on walking `cwd`'s filesystem ancestry, which
+would miss that). That query's own failure is split three ways: exit
+status 1 (`--get-regexp`'s "no matching key") means a real repo with no
+filters configured, not an error; git's own specific, stable fatal message
+for "no repository at all" (`"<scope> can only be used inside a git
+repository"` — the bootstrapping case, e.g. `GitCheckpointer::detect`'s
+first probe or `test_support::init_repo`'s `git init` call), checked
+against that same failure's stderr, is equally benign; anything else (a
+malformed or unreadable local config, the query timing out) is a real
+failure and propagates as an `Err` from `run_git` itself, rather than being
+silently treated the same as "no filters to neutralise" — the original
+behavior, which risked running a repo-configured filter unconfined if the
+query meant to detect it had itself failed to read.
 
 ## Where to look next
 

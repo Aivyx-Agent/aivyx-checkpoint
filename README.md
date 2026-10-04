@@ -9,13 +9,16 @@ Git-ref checkpoint/rollback for agent tool calls.
 working directory, or returns `None` if it isn't inside a git worktree
 (checkpointing then stays disabled for that root — no error, one log
 line). `checkpoint(tool_name, cancellation)` snapshots the current
-worktree to a shadow ref (`refs/aivyx/checkpoints/<millis>-<pid>-<seq>`)
-via plumbing — a private index, `write-tree`/`commit-tree`/`update-ref` —
-so the caller's real HEAD, index, and worktree are never touched. The pid
-disambiguates refs minted by different processes sharing one repo within
-the same millisecond; refs written before this (`<millis>-<seq>`, no pid)
-are still listed and pruned correctly, since both forms sort lexically by
-their leading millis field. Identical trees are deduplicated (skipped)
+worktree to a shadow ref (`refs/aivyx/checkpoints/<millis>-<pid>-<seq>`,
+`pid` zero-padded to a fixed width so same-millisecond refs always compare
+consistently) via plumbing — a private index, `write-tree`/`commit-tree`/
+`update-ref` — so the caller's real HEAD, index, and worktree are never
+touched. The pid disambiguates refs minted by different processes sharing
+one repo within the same millisecond; refs in either older format this
+crate has produced (`<millis>-<seq>`, no pid; or `<millis>-<pid>-<seq>`
+with an unpadded pid) are still listed and pruned correctly alongside
+current ones, since every form sorts lexically by its leading millis
+field. Identical trees are deduplicated (skipped)
 automatically. `latest_ref(cancellation)` returns the most recent
 checkpoint ref, or `None` if none exist yet. `restore_to(ref_name,
 cancellation)` restores the worktree to exactly match that ref's tree —
