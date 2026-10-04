@@ -443,6 +443,10 @@ async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec
         for (key, value) in envs {
             command.env(key, value);
         }
+        // The "no repository here" case below is recognised by git's own
+        // message, so keep that message untranslated whatever the user's
+        // locale.
+        command.env("LC_ALL", "C").env("LANGUAGE", "");
         let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
             .await
             .map_err(|_| format!("git config --get-regexp ({scope}) timed out"))?
