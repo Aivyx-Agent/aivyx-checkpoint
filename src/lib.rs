@@ -7,8 +7,10 @@
 //! arbitrary shell-command effects) can be rewound with plain git commands:
 //! `git log refs/aivyx/checkpoints/...`, `git checkout <ref> -- <path>`.
 //!
-//! Best-effort by design: a checkpoint failure logs a warning and never
-//! blocks the tool call — it's a safety net, not a gate.
+//! Best-effort by design: [`GitCheckpointer::checkpoint`] logs a warning on
+//! failure and never blocks the tool call it's protecting — it's a safety
+//! net, not a gate. [`GitCheckpointer::try_checkpoint`] is the same
+//! operation for a caller that wants the error instead.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -72,11 +74,25 @@ impl GitCheckpointer {
     }
 
     /// Snapshots the current worktree. Never fails the caller: every error
-    /// path logs and returns.
+    /// path logs and returns. Calls [`Self::try_checkpoint`] and discards
+    /// the error after logging it — use that instead when the caller needs
+    /// to know a checkpoint failed.
     pub async fn checkpoint(&self, tool_name: &str, cancellation: &CancellationToken) {
-        if let Err(err) = self.checkpoint_inner(tool_name, cancellation).await {
+        if let Err(err) = self.try_checkpoint(tool_name, cancellation).await {
             tracing::warn!(tool = %tool_name, error = %err, "checkpoint failed (tool call proceeds)");
         }
+    }
+
+    /// Snapshots the current worktree, like [`Self::checkpoint`], but
+    /// returns the error instead of only logging it — for callers that
+    /// want to surface or act on a checkpoint failure rather than silently
+    /// proceeding.
+    pub async fn try_checkpoint(
+        &self,
+        tool_name: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        self.checkpoint_inner(tool_name, cancellation).await
     }
 
     async fn checkpoint_inner(
@@ -84,9 +100,7 @@ impl GitCheckpointer {
         tool_name: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        let index_dir = self.git_dir.join("aivyx");
-        std::fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
-        let index = index_dir.join("index");
+        let index = self.private_index()?;
         let index_env: Vec<(&str, &str)> =
             vec![("GIT_INDEX_FILE", index.to_str().ok_or("non-utf8 git dir")?)];
 
@@ -139,13 +153,20 @@ impl GitCheckpointer {
             .to_string();
 
         // Zero-padded millis sort lexically == chronologically (until the
-        // year 2286), which is what the retention pass below relies on.
+        // year 2286), which is what the retention pass below relies on —
+        // and still does with the pid segment added below, since millis
+        // remains the leading field either way. The pid disambiguates
+        // across processes: `seq` alone starts at 0 in every process (each
+        // has its own `GitCheckpointer`), so two processes checkpointing
+        // the same repo within the same millisecond used to mint the exact
+        // same ref name and clobber each other's ref.
         let millis = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_err(|e| e.to_string())?
             .as_millis();
+        let pid = std::process::id();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
-        let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{seq:04}");
+        let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{pid}-{seq:04}");
         let update_args: Vec<String> = vec!["update-ref".into(), ref_name.clone(), commit];
         self.git(&update_args, &[], cancellation).await?;
         tracing::info!(tool = %tool_name, r#ref = %ref_name, "worktree checkpoint saved");
@@ -203,9 +224,7 @@ impl GitCheckpointer {
         ref_name: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
-        let index_dir = self.git_dir.join("aivyx");
-        std::fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
-        let index = index_dir.join("index");
+        let index = self.private_index()?;
         let index_env: Vec<(&str, &str)> =
             vec![("GIT_INDEX_FILE", index.to_str().ok_or("non-utf8 git dir")?)];
 
@@ -239,6 +258,34 @@ impl GitCheckpointer {
         Ok(())
     }
 
+    /// Ensures `<git-dir>/aivyx/` exists and returns the private index
+    /// path, first clearing a leftover `index.lock` old enough to be a
+    /// stale lock rather than a genuinely in-flight write. A checkpoint
+    /// that's cancelled or times out mid-`git add` leaves that lock file
+    /// behind (this is git's own locking convention, not ours); since
+    /// nothing else ever touches this private index, a lock surviving
+    /// longer than [`GIT_TIMEOUT`] — the longest a legitimate `git`
+    /// invocation here is ever allowed to run — cannot belong to a call
+    /// still in progress, so it's safe to remove before staging. Without
+    /// this, every later checkpoint (this session and future ones, since
+    /// the lock is a file on disk) fails against the same stale lock,
+    /// silently (`checkpoint()`'s own best-effort contract).
+    fn private_index(&self) -> Result<PathBuf, String> {
+        let index_dir = self.git_dir.join("aivyx");
+        std::fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
+        let index = index_dir.join("index");
+        let lock = index_dir.join("index.lock");
+        if let Ok(metadata) = std::fs::metadata(&lock)
+            && let Ok(modified) = metadata.modified()
+            && modified.elapsed().is_ok_and(|age| age > GIT_TIMEOUT)
+        {
+            // Best-effort: if another process wins a race and removes it
+            // first, there's nothing left to clean up either way.
+            let _ = std::fs::remove_file(&lock);
+        }
+        Ok(index)
+    }
+
     async fn git(
         &self,
         args: &[String],
@@ -255,17 +302,42 @@ impl GitCheckpointer {
 
 /// Builds `:(exclude)` pathspecs for every deny path inside `cwd`, relative
 /// to `cwd` (git resolves pathspecs against the command's working
-/// directory). `pub` because it has consumers beyond this file: any git
-/// operation that sweeps "everything under the worktree" needs the same
-/// carve-outs — `aivyx-coder`'s own `git_read`/`git_commit` tools call this
-/// directly, cross-crate, from their own production code.
+/// directory). A *bare* entry — a single path component, possibly with
+/// glob characters, e.g. `.env`, `.env.*`, `*.pem`, `id_rsa` — isn't a path
+/// under `cwd` at all; it's a basename pattern meant to match anywhere in
+/// the tree (the same "bare pattern" notion `aivyx-coder`'s own
+/// `aivyx-confine::is_bare_pattern` uses for its unrelated deny-paths
+/// matching), so it becomes a recursive glob exclusion
+/// (`:(exclude,glob)**/<pattern>`) instead of being resolved against `cwd`
+/// — which would simply never match and silently drop the entry, letting
+/// files it was meant to deny (e.g. a nested `svc/.env`) into the snapshot.
+/// `pub` because it has consumers beyond this file: any git operation that
+/// sweeps "everything under the worktree" needs the same carve-outs —
+/// `aivyx-coder`'s own `git_read`/`git_commit` tools call this directly,
+/// cross-crate, from their own production code.
 pub fn exclude_pathspecs(cwd: &Path, deny_paths: &[PathBuf]) -> Vec<String> {
     deny_paths
         .iter()
-        .filter_map(|denied| denied.strip_prefix(cwd).ok())
-        .filter(|rel| !rel.as_os_str().is_empty())
-        .map(|rel| format!(":(exclude){}", rel.display()))
+        .filter_map(|denied| {
+            if is_bare_deny_pattern(denied) {
+                return Some(format!(":(exclude,glob)**/{}", denied.display()));
+            }
+            let rel = denied.strip_prefix(cwd).ok()?;
+            if rel.as_os_str().is_empty() {
+                return None;
+            }
+            Some(format!(":(exclude){}", rel.display()))
+        })
         .collect()
+}
+
+/// True for a deny-paths entry with a single path component — no directory
+/// separator anywhere in it, so it can't be `strip_prefix`'d against `cwd`
+/// as a real path. Identical classification to `aivyx-confine::is_bare_pattern`
+/// (duplicated rather than depended on: this crate stays config-agnostic
+/// with no knowledge of the sandbox crate).
+fn is_bare_deny_pattern(path: &Path) -> bool {
+    path.parent() == Some(Path::new(""))
 }
 
 /// Always passed to unconfined git: no fsmonitor, no hooks (plumbing like
@@ -288,6 +360,25 @@ const REPO_FILTER_QUERY: [&str; 5] = [
     "--get-regexp",
     r"^filter\..+\.(clean|smudge|process)$",
 ];
+
+/// True when `cwd` or any ancestor contains a `.git` entry — mirroring
+/// git's own repository discovery, without invoking git (which would
+/// recurse back into [`repo_program_overrides`], the only caller). A `.git`
+/// entry can be a directory (the normal case) or a file (a linked worktree
+/// or submodule's gitdir pointer) — `exists()` covers either, and reading
+/// it to resolve where it actually points isn't needed here: all this
+/// answers is "does a repository exist to query", not "where exactly is
+/// it".
+fn finds_a_repository(cwd: &Path) -> bool {
+    let mut dir = Some(cwd);
+    while let Some(d) = dir {
+        if d.join(".git").exists() {
+            return true;
+        }
+        dir = d.parent();
+    }
+    false
+}
 
 fn repo_filter_query(scope: &'static str) -> Vec<&'static str> {
     let mut args: Vec<&str> = SAFE_GIT_CONFIG.to_vec();
@@ -330,9 +421,27 @@ fn filter_overrides<'a>(listings: impl IntoIterator<Item = &'a str>) -> Vec<Stri
 /// smudge or process filter there would otherwise run with this crate's
 /// unconfined privileges on `add`/`read-tree`. Filters from the user's own
 /// global or system config (git-lfs, say) are trusted and left alone.
-/// Reading config runs nothing; a failed query (not a repository, no
-/// worktree config, no such keys) means nothing to switch off.
-async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String> {
+/// Reading config runs nothing; a query that finds no matching keys (exit
+/// status 1 — `--get-regexp`'s documented "not found" status, the normal
+/// case for a repository with no filters configured) means nothing to
+/// switch off for that scope. Any other failure — a malformed or unreadable
+/// config file, the query timing out, failing to spawn `git` at all — is a
+/// real error and is returned as one rather than silently treated the same
+/// as "no filters": this is the query that decides whether a repo-defined
+/// filter driver gets neutralised before running with this crate's
+/// unconfined privileges, so continuing with no overrides when the query
+/// itself couldn't be trusted would risk running one unneutralised.
+async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec<String>, String> {
+    // No repository anywhere in `cwd`'s ancestry (the bootstrapping case —
+    // `GitCheckpointer::detect`'s own first probe, or a `git init` call
+    // that's about to create one, as `test_support::init_repo` makes
+    // first) means there's no repo-local config to query at all, which is
+    // an entirely different, benign situation from a repository that
+    // exists but whose config this crate's query below fails to read —
+    // only the latter is the real error this function now surfaces.
+    if !finds_a_repository(cwd) {
+        return Ok(Vec::new());
+    }
     let mut listings = Vec::new();
     for scope in ["--local", "--worktree"] {
         let mut command = tokio::process::Command::new("git");
@@ -341,16 +450,25 @@ async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Vec<String
             .current_dir(cwd)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::null())
+            .stderr(std::process::Stdio::piped())
             .kill_on_drop(true);
         for (key, value) in envs {
             command.env(key, value);
         }
-        if let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await {
+        let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
+            .await
+            .map_err(|_| format!("git config --get-regexp ({scope}) timed out"))?
+            .map_err(|e| format!("failed to run git config ({scope}): {e}"))?;
+        if output.status.success() {
             listings.push(String::from_utf8_lossy(&output.stdout).into_owned());
+        } else if output.status.code() != Some(1) {
+            return Err(format!(
+                "git config --get-regexp ({scope}) failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
     }
-    filter_overrides(listings.iter().map(String::as_str))
+    Ok(filter_overrides(listings.iter().map(String::as_str)))
 }
 
 /// The arguments to put before the subcommand of any *blocking*, unconfined
@@ -363,18 +481,58 @@ pub fn unconfined_git_args_blocking(cwd: &Path) -> Vec<String> {
     let listings: Vec<String> = ["--local", "--worktree"]
         .into_iter()
         .filter_map(|scope| {
-            std::process::Command::new("git")
+            let mut command = std::process::Command::new("git");
+            command
                 .args(repo_filter_query(scope))
                 .current_dir(cwd)
                 .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null())
-                .output()
-                .ok()
-                .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+                .stderr(std::process::Stdio::null());
+            blocking_output_within(command, GIT_TIMEOUT)
+                .map(|out| String::from_utf8_lossy(&out).into_owned())
         })
         .collect();
     args.extend(filter_overrides(listings.iter().map(String::as_str)));
     args
+}
+
+/// Runs `command` to completion, killing it and returning `None` if it
+/// doesn't finish within `timeout`. The one blocking (non-tokio) process
+/// invocation this crate makes — [`run_git`]'s own async path already gets
+/// a bound from `tokio::time::timeout`; this gives
+/// [`unconfined_git_args_blocking`]'s config queries the same [`GIT_TIMEOUT`]
+/// bound rather than running unbounded. Polls with `try_wait` instead of a
+/// watcher thread so there's nothing else to clean up on the success path;
+/// stdout is only read after the child has exited, which is fine for the
+/// short config-key listings this is used for, but would risk a pipe-buffer
+/// deadlock for a command with substantial output.
+fn blocking_output_within(
+    mut command: std::process::Command,
+    timeout: Duration,
+) -> Option<Vec<u8>> {
+    command.stdout(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let start = std::time::Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                let mut buf = Vec::new();
+                if let Some(mut out) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = out.read_to_end(&mut buf);
+                }
+                return Some(buf);
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// One plumbing invocation:/// One plumbing invocation: trusted fixed argv (never model-controlled),
@@ -391,7 +549,7 @@ pub fn unconfined_git_args_blocking(cwd: &Path) -> Vec<String> {
 /// (see [`repo_program_overrides`]). Diff drivers only run for diffs:
 /// callers that diff pass `--no-ext-diff --no-textconv` themselves.
 pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
-    let neutralise = repo_program_overrides(cwd, envs).await;
+    let neutralise = repo_program_overrides(cwd, envs).await?;
     let mut command = tokio::process::Command::new("git");
     command
         .args(SAFE_GIT_CONFIG)
@@ -726,6 +884,192 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn try_checkpoint_returns_the_underlying_error() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        std::fs::remove_dir_all(cwd.join(".git")).unwrap();
+
+        let result = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await;
+
+        assert!(result.is_err(), "try_checkpoint must surface the failure");
+    }
+
+    #[tokio::test]
+    async fn checkpoint_still_logs_and_continues_on_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        std::fs::remove_dir_all(cwd.join(".git")).unwrap();
+
+        // Must not panic — checkpoint() keeps its best-effort behaviour.
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+    }
+
+    #[tokio::test]
+    async fn bare_deny_patterns_exclude_every_matching_basename_from_the_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        std::fs::write(cwd.join(".env"), "SECRET=1\n").unwrap();
+        std::fs::create_dir(cwd.join("svc")).unwrap();
+        std::fs::write(cwd.join("svc").join(".env"), "SECRET=2\n").unwrap();
+        std::fs::create_dir(cwd.join("certs")).unwrap();
+        std::fs::write(cwd.join("certs").join("a.pem"), "CERT\n").unwrap();
+        std::fs::write(cwd.join("public.txt"), "fine\n").unwrap();
+
+        let deny = vec![PathBuf::from(".env"), PathBuf::from("*.pem")];
+        let cp = GitCheckpointer::detect(&cwd, deny).await.unwrap();
+        cp.checkpoint("run_shell", &CancellationToken::new()).await;
+
+        let refs = checkpoint_refs(&cwd).await;
+        let tree = run_git(&cwd, &["ls-tree", "-r", "--name-only", &refs[0]], &[])
+            .await
+            .unwrap();
+        assert!(
+            !tree.contains(".env"),
+            "bare `.env` leaked into the snapshot: {tree}"
+        );
+        assert!(
+            !tree.contains("a.pem"),
+            "bare `*.pem` leaked into the snapshot: {tree}"
+        );
+        assert!(tree.contains("public.txt"));
+    }
+
+    #[tokio::test]
+    async fn restore_to_leaves_a_bare_pattern_denied_file_created_after_the_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let deny = vec![PathBuf::from(".env")];
+        let cp = GitCheckpointer::detect(&cwd, deny).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        std::fs::create_dir(cwd.join("svc")).unwrap();
+        std::fs::write(cwd.join("svc").join(".env"), "SECRET=1\n").unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(
+            cwd.join("svc").join(".env").exists(),
+            "restore_to must never delete a bare-pattern denied file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_malformed_local_config_makes_try_checkpoint_fail_instead_of_silently_skipping_overrides()
+     {
+        // Regression guard: repo_program_overrides used to only push a
+        // listing on command success, silently treating a genuine config
+        // read failure (not just "no matching key") as "no filters to
+        // neutralise" — which could let a repo-configured filter run
+        // unconfined.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+
+        let config = cwd.join(".git/config");
+        let mut contents = std::fs::read_to_string(&config).unwrap();
+        contents.push_str("[bad\n");
+        std::fs::write(&config, contents).unwrap();
+
+        let result = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a malformed local config must surface as an error, not be silently ignored"
+        );
+    }
+
+    #[tokio::test]
+    async fn blocking_args_still_time_out_a_wedged_config_query() {
+        let start = std::time::Instant::now();
+        let mut command = std::process::Command::new("sleep");
+        command.arg("5");
+        let result = blocking_output_within(command, Duration::from_millis(100));
+        assert!(
+            result.is_none(),
+            "a timed-out command must not return output"
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(2),
+            "the timeout must actually bound the wait, took {:?}",
+            start.elapsed()
+        );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_ref_names_include_the_process_id() {
+        // Regression guard: two checkpointer instances (standing in for two
+        // separate processes sharing one repo) both start their own `seq`
+        // counter at 0, so a millis-collision between them would otherwise
+        // produce the exact same ref name and clobber each other's ref.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+
+        let refs = checkpoint_refs(dir.path()).await;
+        assert_eq!(refs.len(), 1);
+        let pid = std::process::id().to_string();
+        assert!(
+            refs[0].contains(&pid),
+            "ref name must include this process's pid: {}",
+            refs[0]
+        );
+    }
+
+    #[tokio::test]
+    async fn old_format_refs_are_still_listed_and_pruned_alongside_new_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        // Simulate a ref created by a pre-pid build: `{millis}-{seq}`, no
+        // pid component, comfortably older than anything made below.
+        let old_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis()
+            - 10_000;
+        let old_ref = format!("refs/aivyx/checkpoints/{old_millis:013}-0000");
+        let head = run_git(&cwd, &["rev-parse", "HEAD"], &[]).await.unwrap();
+        run_git(&cwd, &["update-ref", &old_ref, head.trim()], &[])
+            .await
+            .unwrap();
+
+        let mut cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.set_retain(2);
+        for i in 0..3 {
+            std::fs::write(cwd.join("tracked.txt"), format!("v{i}\n")).unwrap();
+            cp.checkpoint("write_file", &CancellationToken::new()).await;
+        }
+
+        let refs = checkpoint_refs(&cwd).await;
+        assert_eq!(
+            refs.len(),
+            2,
+            "retention must still cap total refs with an old-format ref mixed in: {refs:?}"
+        );
+        assert!(
+            !refs.contains(&old_ref),
+            "the oldest ref (old format) should have been pruned first: {refs:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn latest_ref_returns_the_most_recent_checkpoint() {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).await;
@@ -856,6 +1200,64 @@ mod tests {
             "v1\n",
             "restore_to must still restore the worktree content from the checkpoint"
         );
+    }
+
+    #[tokio::test]
+    async fn checkpoint_removes_a_stale_private_index_lock() {
+        // Regression guard: a checkpoint cancelled or timed out mid-`git
+        // add` leaves `<git-dir>/aivyx/index.lock` behind; every later
+        // checkpoint must still succeed rather than failing silently
+        // forever against that stale lock.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let index_dir = cwd.join(".git/aivyx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let lock = index_dir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let stale = std::time::SystemTime::now() - GIT_TIMEOUT - Duration::from_secs(5);
+        std::fs::File::open(&lock)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.checkpoint("write_file", &CancellationToken::new()).await;
+
+        assert_eq!(
+            checkpoint_refs(&cwd).await.len(),
+            1,
+            "checkpoint must succeed despite the stale lock"
+        );
+        assert!(!lock.exists(), "the stale lock must be removed");
+    }
+
+    #[tokio::test]
+    async fn a_fresh_private_index_lock_is_left_alone() {
+        // A lock younger than the crate's git timeout belongs to a
+        // checkpoint that may still be genuinely in flight (e.g. a
+        // concurrent call) — it must not be swept away.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+
+        let index_dir = cwd.join(".git/aivyx");
+        std::fs::create_dir_all(&index_dir).unwrap();
+        let lock = index_dir.join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        // Freshly written: mtime is "now", well inside the timeout window.
+
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        let result = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "a fresh lock should still block git add, proving it wasn't removed"
+        );
+        assert!(lock.exists(), "a fresh lock must not be removed");
     }
 
     #[tokio::test]
