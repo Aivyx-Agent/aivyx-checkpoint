@@ -719,7 +719,10 @@ mod tests {
     /// A marker-writing script, and a shell snippet that runs it.
     fn marker_script(dir: &Path, name: &str) -> (PathBuf, String) {
         let marker = dir.join(format!("{name}-ran"));
-        (marker.clone(), format!("sh -c 'touch {}; cat'", marker.display()))
+        (
+            marker.clone(),
+            format!("sh -c 'touch {}; cat'", marker.display()),
+        )
     }
 
     #[tokio::test]
@@ -733,8 +736,12 @@ mod tests {
         let marks = tempfile::tempdir().unwrap();
         let (clean, clean_cmd) = marker_script(marks.path(), "clean");
         let (smudge, smudge_cmd) = marker_script(marks.path(), "smudge");
-        run_git(&cwd, &["config", "filter.evil.clean", &clean_cmd], &[]).await.unwrap();
-        run_git(&cwd, &["config", "filter.evil.smudge", &smudge_cmd], &[]).await.unwrap();
+        run_git(&cwd, &["config", "filter.evil.clean", &clean_cmd], &[])
+            .await
+            .unwrap();
+        run_git(&cwd, &["config", "filter.evil.smudge", &smudge_cmd], &[])
+            .await
+            .unwrap();
         std::fs::write(cwd.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
         let hook = cwd.join(".git/hooks/reference-transaction");
         std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
@@ -752,8 +759,13 @@ mod tests {
         let refs = checkpoint_refs(&cwd).await;
         assert_eq!(refs.len(), 1, "the checkpoint itself still works");
         std::fs::write(cwd.join("tracked.txt"), "later\n").unwrap();
-        cp.restore_to(&refs[0], &CancellationToken::new()).await.unwrap();
-        assert_eq!(std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(), "changed\n");
+        cp.restore_to(&refs[0], &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "changed\n"
+        );
 
         assert!(!clean.exists(), "a repo clean filter ran unconfined");
         assert!(!smudge.exists(), "a repo smudge filter ran unconfined");
@@ -788,10 +800,19 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         init_repo(dir.path()).await;
         let cwd = dir.path().canonicalize().unwrap();
-        run_git(&cwd, &["config", "filter.evil.clean", "touch x"], &[]).await.unwrap();
+        run_git(&cwd, &["config", "filter.evil.clean", "touch x"], &[])
+            .await
+            .unwrap();
         let args = unconfined_git_args_blocking(&cwd);
-        for needed in ["core.fsmonitor=false", "core.hooksPath=/dev/null", "filter.evil.clean="] {
-            assert!(args.iter().any(|a| a == needed), "{needed} missing from {args:?}");
+        for needed in [
+            "core.fsmonitor=false",
+            "core.hooksPath=/dev/null",
+            "filter.evil.clean=",
+        ] {
+            assert!(
+                args.iter().any(|a| a == needed),
+                "{needed} missing from {args:?}"
+            );
         }
     }
 
@@ -808,7 +829,9 @@ mod tests {
         std::fs::write(cwd.join("tracked.txt"), "shout\n").unwrap();
         let env = [("GIT_CONFIG_GLOBAL", global.path().to_str().unwrap())];
         run_git(&cwd, &["add", "tracked.txt"], &env).await.unwrap();
-        let staged = run_git(&cwd, &["show", ":tracked.txt"], &env).await.unwrap();
+        let staged = run_git(&cwd, &["show", ":tracked.txt"], &env)
+            .await
+            .unwrap();
         assert_eq!(staged, "SHOUT\n");
     }
 
