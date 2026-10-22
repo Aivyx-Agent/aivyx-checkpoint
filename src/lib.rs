@@ -279,6 +279,30 @@ impl GitCheckpointer {
         Ok(())
     }
 
+    /// The tree a checkpoint taken now would hold, staged into `index`
+    /// instead of the private index — for a caller that wants to check a
+    /// snapshot against the worktree. Start `index` as a copy of
+    /// `<git-dir>/aivyx/index`: git keeps an already-indexed path even once
+    /// it's ignored, so only the same starting index gives the same tree
+    /// (and its stat data spares re-hashing the worktree).
+    pub async fn tree_in_index(
+        &self,
+        index: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<String, String> {
+        let index_env: Vec<(&str, &str)> = vec![(
+            "GIT_INDEX_FILE",
+            index.to_str().ok_or("non-utf8 index path")?,
+        )];
+        self.stage_worktree(&index_env, cancellation).await?;
+        let write_tree_args = vec!["write-tree".to_string()];
+        Ok(self
+            .git(&write_tree_args, &index_env, cancellation)
+            .await?
+            .trim()
+            .to_string())
+    }
+
     /// Stages the worktree into the private index (`index_env`): `add -A`
     /// minus `deny_paths` and untracked generated files. Generated paths
     /// an earlier snapshot staged (before they matched, or by an older
@@ -1635,5 +1659,38 @@ mod tests {
             std::fs::read_to_string(dir.path().join("target/out")).unwrap(),
             "built\n"
         );
+    }
+
+    #[tokio::test]
+    async fn tree_in_index_matches_the_checkpoint_it_would_take() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/out"), "built\n").unwrap();
+        std::fs::write(dir.path().join("new.rs"), "fn main() {}\n").unwrap();
+        let cp = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(generated());
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let latest = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+        let want = run_git(
+            dir.path(),
+            &["rev-parse", &format!("{latest}^{{tree}}")],
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let git_dir = dir.path().join(".git");
+        let copy = git_dir.join("verify-index");
+        std::fs::copy(git_dir.join("aivyx/index"), &copy).unwrap();
+        let got = cp
+            .tree_in_index(&copy, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(got, want.trim());
     }
 }
