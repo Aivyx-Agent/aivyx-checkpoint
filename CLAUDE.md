@@ -75,6 +75,20 @@ deletes the oldest refs beyond that count — deleting the ref is enough, the
 underlying commit/tree objects become unreferenced and age out via normal
 `git gc`.
 
+### Generated files
+
+`with_generated_ignore(patterns)` (opt-in; `aivyx-coder` passes its
+`[git] ignore` list) keeps untracked build output and caches out of
+snapshots in a project whose `.gitignore` doesn't cover them. Before every
+`add -A` (`stage_worktree`, shared by checkpoint and restore),
+`untracked_generated` asks `git ls-files --others --ignored --exclude=...`
+against the user's own index — twice: once with `--directory` so `target/`
+is one entry, once without (skipping those directories) for generated
+files inside a not-yet-tracked directory, which `--directory` hides. The
+paths are removed from the private index (`rm --cached -f`, since entries an
+earlier snapshot staged would otherwise keep being updated) and excluded
+from `add -A`. Restore therefore leaves them alone, like gitignored files.
+
 ### Private-index lock and config-query reliability
 
 `checkpoint`/`restore_to` both stage into the private index

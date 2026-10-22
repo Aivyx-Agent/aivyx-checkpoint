@@ -33,6 +33,10 @@ pub struct GitCheckpointer {
     /// `--absolute-git-dir`, resolved once at detection.
     git_dir: PathBuf,
     deny_paths: Vec<PathBuf>,
+    /// Generated files (build output, caches) in `.gitignore` syntax,
+    /// kept out of snapshots while git doesn't track them. See
+    /// [`Self::with_generated_ignore`].
+    generated_ignore: Vec<String>,
     /// Tree oid of the most recent checkpoint, for skipping no-op
     /// snapshots (several mutations often land between identical trees,
     /// e.g. a failed edit).
@@ -62,10 +66,25 @@ impl GitCheckpointer {
             cwd: cwd.to_path_buf(),
             git_dir,
             deny_paths,
+            generated_ignore: Vec::new(),
             last_tree: Mutex::new(None),
             seq: AtomicU64::new(0),
             retain: RETAIN,
         })
+    }
+
+    /// Keeps generated files out of every snapshot: build output and
+    /// caches matching `patterns` (`.gitignore` syntax, e.g. `target/`,
+    /// `*.pyc`) in a project whose own `.gitignore` doesn't cover them.
+    /// Only while untracked — a file in the user's index is snapshotted
+    /// as usual, exactly as `.gitignore` itself behaves. Without this, a
+    /// fresh project's build output is copied into every checkpoint, and
+    /// the retained refs keep it from ever being collected (2026-10-22:
+    /// one 33-minute agent run left 305 MB of `target/` objects). Restore
+    /// leaves these files alone, as it does gitignored ones.
+    pub fn with_generated_ignore(mut self, patterns: Vec<String>) -> Self {
+        self.generated_ignore = patterns;
+        self
     }
 
     #[cfg(test)]
@@ -109,9 +128,7 @@ impl GitCheckpointer {
         // Landlock carves out of the kernel sandbox) would be copied into
         // readable .git objects, and `git show <checkpoint>:<denied-file>`
         // would read it straight through the sandbox.
-        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-        add_args.extend(exclude_pathspecs(&self.cwd, &self.deny_paths));
-        self.git(&add_args, &index_env, cancellation).await?;
+        self.stage_worktree(&index_env, cancellation).await?;
 
         let write_tree_args = vec!["write-tree".to_string()];
         let tree = self
@@ -241,9 +258,9 @@ impl GitCheckpointer {
         // this exclusion a deny-listed file that currently exists on disk
         // would show up as "present in FROM-index, absent from target tree"
         // and get deleted by read-tree below.
-        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
-        add_args.extend(exclude_pathspecs(&self.cwd, &self.deny_paths));
-        self.git(&add_args, &index_env, cancellation).await?;
+        // Generated files are excluded the same way, so ones that are in
+        // no snapshot survive the reset rather than being deleted.
+        self.stage_worktree(&index_env, cancellation).await?;
 
         let reset_args: Vec<String> = vec![
             "read-tree".into(),
@@ -260,6 +277,95 @@ impl GitCheckpointer {
         // change.
         *self.last_tree.lock().unwrap() = None;
         Ok(())
+    }
+
+    /// Stages the worktree into the private index (`index_env`): `add -A`
+    /// minus `deny_paths` and untracked generated files. Generated paths
+    /// an earlier snapshot staged (before they matched, or by an older
+    /// version) are dropped from the index first; `add -A` would otherwise
+    /// keep updating them, since exclusions only stop new paths.
+    async fn stage_worktree(
+        &self,
+        index_env: &[(&str, &str)],
+        cancellation: &CancellationToken,
+    ) -> Result<(), String> {
+        let generated = self.untracked_generated(cancellation).await?;
+        if !generated.is_empty() {
+            let mut rm_args: Vec<String> =
+                ["rm", "--cached", "-f", "-r", "-q", "--ignore-unmatch", "--"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect();
+            rm_args.extend(generated.iter().map(|path| format!(":(literal){path}")));
+            self.git(&rm_args, index_env, cancellation).await?;
+        }
+        let mut add_args: Vec<String> = vec!["add".into(), "-A".into(), "--".into(), ".".into()];
+        add_args.extend(exclude_pathspecs(&self.cwd, &self.deny_paths));
+        add_args.extend(
+            generated
+                .iter()
+                .map(|path| format!(":(exclude,literal){path}")),
+        );
+        self.git(&add_args, index_env, cancellation)
+            .await
+            .map(|_| ())
+    }
+
+    /// Untracked paths under `cwd` matching `generated_ignore`, relative
+    /// to `cwd`; a wholly generated directory is one entry (`target/`).
+    /// "Untracked" is judged against the user's own index, not the private
+    /// one, so this needs no `GIT_INDEX_FILE`.
+    ///
+    /// Two queries: `--directory` collapses generated directories, but it
+    /// also reports a new, not-yet-tracked directory as a single
+    /// non-ignored entry, hiding the generated files inside it
+    /// (`pkg/mod.pyc` in an untracked `pkg/`). The second query lists
+    /// those file by file, skipping the directories the first one found
+    /// so `target/` isn't listed a file at a time.
+    async fn untracked_generated(
+        &self,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<String>, String> {
+        if self.generated_ignore.is_empty() {
+            return Ok(Vec::new());
+        }
+        // `extra` goes last: it may end in `-- <pathspec>...`.
+        let query = |extra: &[&str]| {
+            let mut args: Vec<String> = ["ls-files", "-z", "--others", "--ignored"]
+                .into_iter()
+                .map(String::from)
+                .collect();
+            args.extend(
+                self.generated_ignore
+                    .iter()
+                    .map(|pattern| format!("--exclude={pattern}")),
+            );
+            args.extend(extra.iter().map(|arg| arg.to_string()));
+            args
+        };
+        let split = |listed: String| -> Vec<String> {
+            listed
+                .split('\0')
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect()
+        };
+        let directories = query(&["--directory", "--no-empty-directory"]);
+        let mut generated = split(self.git(&directories, &[], cancellation).await?);
+
+        let mut files = query(&["--", "."]);
+        files.extend(
+            generated
+                .iter()
+                .filter(|path| path.ends_with('/'))
+                .map(|dir| format!(":(exclude,literal){dir}")),
+        );
+        for path in split(self.git(&files, &[], cancellation).await?) {
+            if !generated.contains(&path) {
+                generated.push(path);
+            }
+        }
+        Ok(generated)
     }
 
     /// Ensures `<git-dir>/aivyx/` exists and returns the private index
@@ -1400,6 +1506,134 @@ mod tests {
             std::fs::read_to_string(secret_dir.join("key")).unwrap(),
             "TOP-SECRET\n",
             "deny-listed content must survive restore_to unchanged"
+        );
+    }
+
+    async fn tree_of(dir: &Path, rev: &str) -> String {
+        run_git(dir, &["ls-tree", "-r", "--name-only", rev], &[])
+            .await
+            .unwrap()
+    }
+
+    fn generated() -> Vec<String> {
+        vec!["target/".to_string(), "*.pyc".to_string()]
+    }
+
+    #[tokio::test]
+    async fn untracked_generated_files_stay_out_of_the_snapshot() {
+        // A fresh project with no .gitignore: build output must not be
+        // copied into every checkpoint (2026-10-22: 305 MB of `target/`
+        // objects after one 33-minute run).
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        std::fs::create_dir_all(dir.path().join("target/debug")).unwrap();
+        std::fs::write(dir.path().join("target/debug/app"), "binary\n").unwrap();
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/mod.pyc"), "bytecode\n").unwrap();
+        std::fs::write(dir.path().join("pkg/mod.py"), "source\n").unwrap();
+
+        let cp = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(generated());
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let tree = tree_of(dir.path(), &checkpoint_refs(dir.path()).await[0]).await;
+        assert!(tree.contains("pkg/mod.py"), "{tree}");
+        assert!(!tree.contains("target/"), "{tree}");
+        assert!(!tree.contains(".pyc"), "{tree}");
+    }
+
+    #[tokio::test]
+    async fn tracked_files_matching_a_generated_pattern_are_still_snapshotted() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        std::fs::write(dir.path().join("keep.pyc"), "v1\n").unwrap();
+        test_support::git(dir.path(), &["add", "keep.pyc"]).await;
+        std::fs::write(dir.path().join("keep.pyc"), "v2\n").unwrap();
+
+        let cp = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(generated());
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let refs = checkpoint_refs(dir.path()).await;
+        let content = run_git(dir.path(), &["show", &format!("{}:keep.pyc", refs[0])], &[])
+            .await
+            .unwrap();
+        assert_eq!(content, "v2\n");
+    }
+
+    #[tokio::test]
+    async fn generated_files_snapshotted_before_are_dropped_from_later_checkpoints() {
+        // The private index persists across sessions: entries an older
+        // version (or an empty ignore list) staged must not linger.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/out"), "1\n").unwrap();
+        let before = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        before
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(
+            tree_of(dir.path(), &checkpoint_refs(dir.path()).await[0])
+                .await
+                .contains("target/out")
+        );
+
+        std::fs::write(dir.path().join("target/out"), "2\n").unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+        let after = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(generated());
+        after
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let latest = after.latest_ref(&CancellationToken::new()).await.unwrap();
+        let tree = tree_of(dir.path(), &latest).await;
+        assert!(tree.contains("tracked.txt"), "{tree}");
+        assert!(!tree.contains("target/"), "{tree}");
+    }
+
+    #[tokio::test]
+    async fn restore_to_leaves_generated_files_alone() {
+        // Not in any snapshot, so a rewind must neither delete nor revert
+        // build output — while still deleting real files created since.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(generated());
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let good_ref = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+
+        std::fs::create_dir(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/out"), "built\n").unwrap();
+        std::fs::write(dir.path().join("new.rs"), "oops\n").unwrap();
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        cp.restore_to(&good_ref, &CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(!dir.path().join("new.rs").exists());
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("target/out")).unwrap(),
+            "built\n"
         );
     }
 }
