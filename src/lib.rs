@@ -389,6 +389,33 @@ impl GitCheckpointer {
                 generated.push(path);
             }
         }
+        if generated.is_empty() {
+            return Ok(generated);
+        }
+
+        // Leave out what the project's own ignore rules already cover: `add
+        // -A` skips those anyway, and git refuses an `add` whose pathspec
+        // names an ignored path, even an exclude (2026-10-23: every
+        // checkpoint failed in a project whose .gitignore had node_modules/).
+        let mut standard: Vec<String> = [
+            "ls-files",
+            "-z",
+            "--others",
+            "--ignored",
+            "--exclude-standard",
+            "--directory",
+            "--",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        standard.extend(generated.iter().map(|path| format!(":(literal){path}")));
+        let standard = split(self.git(&standard, &[], cancellation).await?);
+        generated.retain(|path| {
+            !standard.iter().any(|ignored| {
+                ignored == path || (ignored.ends_with('/') && path.starts_with(ignored))
+            })
+        });
         Ok(generated)
     }
 
@@ -1568,6 +1595,48 @@ mod tests {
         assert!(tree.contains("pkg/mod.py"), "{tree}");
         assert!(!tree.contains("target/"), "{tree}");
         assert!(!tree.contains(".pyc"), "{tree}");
+    }
+
+    #[tokio::test]
+    async fn generated_paths_the_gitignore_already_covers_dont_fail_the_checkpoint() {
+        // 2026-10-23, ckl build test: a project whose .gitignore lists
+        // node_modules/ failed every checkpoint (87 in one run) because the
+        // generated-files exclusion named that already-ignored path in
+        // `git add`, which git refuses.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        std::fs::write(
+            dir.path().join(".gitignore"),
+            "node_modules/\ndist/\n*.log\n",
+        )
+        .unwrap();
+        test_support::git(dir.path(), &["add", ".gitignore"]).await;
+        std::fs::create_dir_all(dir.path().join("node_modules/react")).unwrap();
+        std::fs::write(dir.path().join("node_modules/react/index.js"), "x\n").unwrap();
+        std::fs::create_dir(dir.path().join("dist")).unwrap();
+        std::fs::write(dir.path().join("dist/app.pyc"), "bytecode\n").unwrap();
+        std::fs::create_dir(dir.path().join("pkg")).unwrap();
+        std::fs::write(dir.path().join("pkg/mod.pyc"), "bytecode\n").unwrap();
+        std::fs::write(dir.path().join("pkg/mod.py"), "source\n").unwrap();
+        std::fs::write(dir.path().join("run.log"), "log\n").unwrap();
+        std::fs::write(dir.path().join("src.ts"), "code\n").unwrap();
+
+        let cp = GitCheckpointer::detect(dir.path(), vec![])
+            .await
+            .unwrap()
+            .with_generated_ignore(vec!["node_modules/".into(), "*.pyc".into(), "*.log".into()]);
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+
+        let tree = tree_of(dir.path(), &checkpoint_refs(dir.path()).await[0]).await;
+        assert!(
+            tree.contains("src.ts") && tree.contains("pkg/mod.py"),
+            "{tree}"
+        );
+        for gone in ["node_modules", "dist", ".pyc", "run.log"] {
+            assert!(!tree.contains(gone), "{gone} in {tree}");
+        }
     }
 
     #[tokio::test]
