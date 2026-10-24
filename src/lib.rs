@@ -137,12 +137,8 @@ impl GitCheckpointer {
             .trim()
             .to_string();
 
-        {
-            let mut last = self.last_tree.lock().unwrap();
-            if last.as_deref() == Some(tree.as_str()) {
-                return Ok(()); // identical to the previous checkpoint
-            }
-            *last = Some(tree.clone());
+        if self.last_tree.lock().unwrap().as_deref() == Some(tree.as_str()) {
+            return Ok(()); // identical to the previous checkpoint
         }
 
         // Synthetic identity: checkpoints must work on machines with no
@@ -154,7 +150,8 @@ impl GitCheckpointer {
             ("GIT_COMMITTER_EMAIL", "checkpoint@aivyx.invalid"),
         ];
         let message = format!("aivyx checkpoint before {tool_name}");
-        let mut commit_args: Vec<String> = vec!["commit-tree".into(), tree, "-m".into(), message];
+        let mut commit_args: Vec<String> =
+            vec!["commit-tree".into(), tree.clone(), "-m".into(), message];
         // Parent on HEAD when it exists (normal case) so `git log <ref>`
         // shows the checkpoint in context; an unborn branch just gets a
         // parentless snapshot.
@@ -190,6 +187,10 @@ impl GitCheckpointer {
         let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{pid:07}-{seq:04}");
         let update_args: Vec<String> = vec!["update-ref".into(), ref_name.clone(), commit];
         self.git(&update_args, &[], cancellation).await?;
+        // Only now: a snapshot whose ref was never written must not make
+        // the next identical one look like a duplicate of it, or that one
+        // reports success with no ref behind it.
+        *self.last_tree.lock().unwrap() = Some(tree);
         tracing::info!(tool = %tool_name, r#ref = %ref_name, "worktree checkpoint saved");
 
         self.prune(cancellation).await
@@ -1029,6 +1030,33 @@ mod tests {
         std::fs::write(dir.path().join("tracked.txt"), "modified again\n").unwrap();
         cp.checkpoint("write_file", &CancellationToken::new()).await;
         assert_eq!(checkpoint_refs(dir.path()).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_whose_ref_failed_is_not_a_duplicate_of_the_next() {
+        // The ref directory is read-only, so the first snapshot fails at
+        // `update-ref`. The second, of the same tree, used to be skipped as
+        // a duplicate and report success with no ref behind it — and
+        // aivyx-coder then took an older ref as "just before this call".
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let refs = dir.path().join(".git/refs/aivyx/checkpoints");
+        std::fs::create_dir_all(&refs).unwrap();
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::write(dir.path().join("tracked.txt"), "modified\n").unwrap();
+
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        let cancel = CancellationToken::new();
+        assert!(cp.try_checkpoint("write_file", &cancel).await.is_err());
+        assert!(
+            cp.try_checkpoint("edit_file", &cancel).await.is_err(),
+            "still no ref"
+        );
+
+        std::fs::set_permissions(&refs, std::fs::Permissions::from_mode(0o755)).unwrap();
+        cp.try_checkpoint("edit_file", &cancel).await.unwrap();
+        assert_eq!(checkpoint_refs(dir.path()).await.len(), 1);
     }
 
     #[tokio::test]
