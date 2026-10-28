@@ -11,6 +11,16 @@
 //! failure and never blocks the tool call it's protecting — it's a safety
 //! net, not a gate. [`GitCheckpointer::try_checkpoint`] is the same
 //! operation for a caller that wants the error instead.
+//!
+//! The git this crate runs is unconfined, but `.git` lies inside the
+//! directory a confined process may write. So the repository is not trusted
+//! to steer it: its own config may hold only settings on an allow-list
+//! (checked before every git invocation), program-running and network
+//! settings are switched off on every invocation regardless, the git
+//! directory and work tree found at detection are passed explicitly, the
+//! paths written under `.git` are checked for symbolic links before each
+//! operation, and only checkpoints this checkpointer took (recorded in
+//! memory) are ever returned or restored by name.
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -28,10 +38,29 @@ const RETAIN: usize = 50;
 /// a wedged repo, not a slow one.
 const GIT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// A checkpoint this checkpointer took: its ref, and the commit and tree
+/// it wrote. Recorded in memory when it is taken, so nothing written to the
+/// repository afterwards (a planted or moved ref) can change what it means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Checkpoint {
+    pub ref_name: String,
+    pub commit: String,
+    pub tree: String,
+}
+
 pub struct GitCheckpointer {
     cwd: PathBuf,
-    /// `--absolute-git-dir`, resolved once at detection.
+    /// `--absolute-git-dir`, resolved and canonicalised once at detection
+    /// and passed to every git as `GIT_DIR`: a `.git` file or directory
+    /// swapped in later is never followed.
     git_dir: PathBuf,
+    /// `--git-common-dir` (the main repository's `.git` for a linked
+    /// worktree; else `git_dir`), where objects, refs and logs live.
+    common_dir: PathBuf,
+    /// The top of the work tree containing `cwd`, resolved at detection
+    /// and passed to every git as `GIT_WORK_TREE`, so no config can move
+    /// it.
+    work_tree: PathBuf,
     deny_paths: Vec<PathBuf>,
     /// Generated files (build output, caches) in `.gitignore` syntax,
     /// kept out of snapshots while git doesn't track them. See
@@ -44,33 +73,45 @@ pub struct GitCheckpointer {
     /// Disambiguates checkpoints created within the same millisecond.
     seq: AtomicU64,
     retain: usize,
+    /// The checkpoints this checkpointer took, oldest first, at most
+    /// `retain` of them. The only refs [`Self::latest_ref`] returns and
+    /// [`Self::restore_to`] accepts.
+    taken: Mutex<Vec<Checkpoint>>,
 }
 
 impl GitCheckpointer {
     /// `None` (with one log line) when `cwd` isn't inside a git worktree —
     /// checkpointing is then disabled for the whole session rather than
     /// warning on every mutation.
+    ///
+    /// Also `None` when the repository can't be checkpointed safely: its
+    /// config holds a setting outside the allow-list (see [`run_git`]), or
+    /// its git directory is neither `<work tree>/.git` nor a linked
+    /// worktree of that work tree, or a path this crate writes under it is
+    /// a symbolic link.
     pub async fn detect(cwd: &Path, deny_paths: Vec<PathBuf>) -> Option<Self> {
-        let git_dir = match run_git(cwd, &["rev-parse", "--absolute-git-dir"], &[]).await {
-            Ok(out) => PathBuf::from(out.trim()),
+        match locate(cwd).await {
+            Ok((git_dir, common_dir, work_tree)) => Some(Self {
+                cwd: cwd.to_path_buf(),
+                git_dir,
+                common_dir,
+                work_tree,
+                deny_paths,
+                generated_ignore: Vec::new(),
+                last_tree: Mutex::new(None),
+                seq: AtomicU64::new(0),
+                retain: RETAIN,
+                taken: Mutex::new(Vec::new()),
+            }),
             Err(err) => {
                 tracing::info!(
                     cwd = %cwd.display(),
                     reason = %err,
-                    "not a git repository — worktree checkpointing disabled"
+                    "no usable git repository — worktree checkpointing disabled"
                 );
-                return None;
+                None
             }
-        };
-        Some(Self {
-            cwd: cwd.to_path_buf(),
-            git_dir,
-            deny_paths,
-            generated_ignore: Vec::new(),
-            last_tree: Mutex::new(None),
-            seq: AtomicU64::new(0),
-            retain: RETAIN,
-        })
+        }
     }
 
     /// Keeps generated files out of every snapshot: build output and
@@ -185,12 +226,31 @@ impl GitCheckpointer {
         let pid = std::process::id();
         let seq = self.seq.fetch_add(1, Ordering::Relaxed);
         let ref_name = format!("refs/aivyx/checkpoints/{millis:013}-{pid:07}-{seq:04}");
-        let update_args: Vec<String> = vec!["update-ref".into(), ref_name.clone(), commit];
+        // `--no-deref` and an empty old value: create this exact ref, and
+        // fail rather than follow or overwrite anything already there.
+        let update_args: Vec<String> = vec![
+            "update-ref".into(),
+            "--no-deref".into(),
+            ref_name.clone(),
+            commit.clone(),
+            String::new(),
+        ];
+        self.check_layout()?;
         self.git(&update_args, &[], cancellation).await?;
         // Only now: a snapshot whose ref was never written must not make
         // the next identical one look like a duplicate of it, or that one
         // reports success with no ref behind it.
-        *self.last_tree.lock().unwrap() = Some(tree);
+        *self.last_tree.lock().unwrap() = Some(tree.clone());
+        {
+            let mut taken = self.taken.lock().unwrap();
+            taken.push(Checkpoint {
+                ref_name: ref_name.clone(),
+                commit,
+                tree,
+            });
+            let excess = taken.len().saturating_sub(self.retain.max(1));
+            taken.drain(..excess);
+        }
         tracing::info!(tool = %tool_name, r#ref = %ref_name, "worktree checkpoint saved");
 
         self.prune(cancellation).await
@@ -208,26 +268,63 @@ impl GitCheckpointer {
             return Ok(());
         }
         for stale in &refs[..refs.len() - self.retain] {
-            let delete_args: Vec<String> =
-                vec!["update-ref".into(), "-d".into(), (*stale).to_string()];
+            // `--no-deref`: a symbolic ref planted here is deleted itself,
+            // never the branch it points at.
+            let delete_args: Vec<String> = vec![
+                "update-ref".into(),
+                "--no-deref".into(),
+                "-d".into(),
+                (*stale).to_string(),
+            ];
             self.git(&delete_args, &[], cancellation).await?;
         }
         Ok(())
     }
 
-    /// The most recent checkpoint ref, or `None` if none have been taken
-    /// yet. Reuses `for-each-ref`'s default lexical sort — checkpoint ref
-    /// names are zero-padded-millis-prefixed, so lexical order is
-    /// chronological order, the same property `prune` above already relies
-    /// on for its retention cutoff.
-    pub async fn latest_ref(&self, cancellation: &CancellationToken) -> Option<String> {
-        let list_args: Vec<String> = vec![
-            "for-each-ref".into(),
-            "--format=%(refname)".into(),
-            "refs/aivyx/checkpoints/".into(),
-        ];
-        let refs = self.git(&list_args, &[], cancellation).await.ok()?;
-        refs.lines().rfind(|l| !l.is_empty()).map(str::to_string)
+    /// The ref of the most recent checkpoint *this checkpointer* took, or
+    /// `None` if it hasn't taken one yet. Never read back from the
+    /// repository: refs under `refs/aivyx/checkpoints/` can be written by a
+    /// confined process (or another process sharing the repository), so a
+    /// name that merely sorts last is never taken for a checkpoint.
+    /// `async` and `cancellation` are kept for API stability.
+    pub async fn latest_ref(&self, _cancellation: &CancellationToken) -> Option<String> {
+        self.taken
+            .lock()
+            .unwrap()
+            .last()
+            .map(|taken| taken.ref_name.clone())
+    }
+
+    /// The checkpoints this checkpointer has taken, oldest first (at most
+    /// the retention count): each one's ref with the commit and tree it
+    /// wrote, as recorded when it was taken.
+    pub fn checkpoints(&self) -> Vec<Checkpoint> {
+        self.taken.lock().unwrap().clone()
+    }
+
+    /// What [`Self::restore_to`] resets to for `target`: the commit
+    /// recorded for a checkpoint ref this checkpointer took, or a full
+    /// object id the caller holds itself (a content address, which nothing
+    /// in the repository can redirect: replace refs are ignored). Any other
+    /// name — a ref planted by a confined process, a branch, an abbreviated
+    /// id — is refused.
+    fn restore_target(&self, target: &str) -> Result<String, String> {
+        if let Some(taken) = self
+            .taken
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|taken| taken.ref_name == target)
+        {
+            return Ok(taken.commit.clone());
+        }
+        if is_full_object_id(target) {
+            return Ok(target.to_ascii_lowercase());
+        }
+        Err(format!(
+            "{target} is not a checkpoint this checkpointer took (nor a full object id)"
+        ))
     }
 
     /// Restores the worktree to exactly match `ref_name`'s tree — including
@@ -241,11 +338,17 @@ impl GitCheckpointer {
     /// ignored content, so a gitignored file created since the checkpoint
     /// (e.g. a stray `target/` artifact or `.env`) is neither captured by
     /// checkpoints nor removed by restore — it silently survives.
+    ///
+    /// `ref_name` must be a checkpoint ref this checkpointer took (see
+    /// [`Self::latest_ref`] and [`Self::checkpoints`]), restored to the
+    /// commit recorded when it was taken even if the ref has moved since,
+    /// or a full object id; anything else is an error.
     pub async fn restore_to(
         &self,
         ref_name: &str,
         cancellation: &CancellationToken,
     ) -> Result<(), String> {
+        let target = self.restore_target(ref_name)?;
         let index = self.private_index()?;
         let index_env: Vec<(&str, &str)> =
             vec![("GIT_INDEX_FILE", index.to_str().ok_or("non-utf8 git dir")?)];
@@ -267,7 +370,8 @@ impl GitCheckpointer {
             "read-tree".into(),
             "--reset".into(),
             "-u".into(),
-            ref_name.to_string(),
+            "--end-of-options".into(),
+            target,
         ];
         self.git(&reset_args, &index_env, cancellation).await?;
 
@@ -291,6 +395,7 @@ impl GitCheckpointer {
         index: &Path,
         cancellation: &CancellationToken,
     ) -> Result<String, String> {
+        self.check_layout()?;
         let index_env: Vec<(&str, &str)> = vec![(
             "GIT_INDEX_FILE",
             index.to_str().ok_or("non-utf8 index path")?,
@@ -432,12 +537,47 @@ impl GitCheckpointer {
     /// this, every later checkpoint (this session and future ones, since
     /// the lock is a file on disk) fails against the same stale lock,
     /// silently (`checkpoint()`'s own best-effort contract).
+    ///
+    /// The directory is never followed through a symbolic link (a confined
+    /// process can replace `.git/aivyx` with one): it must be a real
+    /// directory owned by the git directory's owner, created `0700` when
+    /// missing, and the layout checks of [`Self::check_layout`] run first.
+    /// Only a regular-file lock is ever removed.
     fn private_index(&self) -> Result<PathBuf, String> {
+        self.check_layout()?;
         let index_dir = self.git_dir.join("aivyx");
-        std::fs::create_dir_all(&index_dir).map_err(|e| e.to_string())?;
+        if !real_dir(&index_dir)? {
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+            match builder.create(&index_dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(format!("{}: {e}", index_dir.display())),
+            }
+            if !real_dir(&index_dir)? {
+                return Err(format!("{} vanished", index_dir.display()));
+            }
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let owner = |path: &Path| {
+                std::fs::symlink_metadata(path)
+                    .map(|m| m.uid())
+                    .map_err(|e| format!("{}: {e}", path.display()))
+            };
+            if owner(&index_dir)? != owner(&self.git_dir)? {
+                return Err(format!("{} is owned by another user", index_dir.display()));
+            }
+        }
         let index = index_dir.join("index");
+        if std::fs::symlink_metadata(&index).is_ok_and(|m| !m.is_file()) {
+            return Err(format!("{} is not a regular file", index.display()));
+        }
         let lock = index_dir.join("index.lock");
-        if let Ok(metadata) = std::fs::metadata(&lock)
+        if let Ok(metadata) = std::fs::symlink_metadata(&lock)
+            && metadata.is_file()
             && let Ok(modified) = metadata.modified()
             && modified.elapsed().is_ok_and(|age| age > GIT_TIMEOUT)
         {
@@ -455,11 +595,158 @@ impl GitCheckpointer {
         cancellation: &CancellationToken,
     ) -> Result<String, String> {
         let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let git_dir = self.git_dir.to_str().ok_or("non-utf8 git dir")?;
+        let work_tree = self.work_tree.to_str().ok_or("non-utf8 work tree")?;
+        // Always this repository and this work tree, whatever `.git`,
+        // `core.worktree` or the inherited environment say.
+        let mut envs: Vec<(&str, &str)> = envs.to_vec();
+        envs.push(("GIT_DIR", git_dir));
+        envs.push(("GIT_WORK_TREE", work_tree));
         tokio::select! {
-            result = run_git(&self.cwd, &args, envs) => result,
+            result = run_git(&self.cwd, &args, &envs) => result,
             _ = cancellation.cancelled() => Err("cancelled".to_string()),
         }
     }
+
+    /// Re-checks, before each operation, that the paths this crate's
+    /// unconfined git writes under are still what they were at detection:
+    /// the git directory and common directory are real, unmoved
+    /// directories, and none of `aivyx/`, `objects/` (with its fan-out
+    /// directories), `refs/aivyx/checkpoints/` or the matching reflog
+    /// directories is a symbolic link, which would make git write outside
+    /// the repository. Also refuses `objects/info/alternates`, through which
+    /// a restore could read objects from another repository. A confined
+    /// process can change all of these between calls, so they are checked
+    /// every time, not once.
+    fn check_layout(&self) -> Result<(), String> {
+        check_layout(&self.git_dir, &self.common_dir)
+    }
+}
+
+/// See [`GitCheckpointer::check_layout`].
+fn check_layout(git_dir: &Path, common_dir: &Path) -> Result<(), String> {
+    for dir in [git_dir, common_dir] {
+        if !real_dir(dir)? {
+            return Err(format!("{} is missing", dir.display()));
+        }
+        if dir.canonicalize().map_err(|e| e.to_string())? != dir {
+            return Err(format!("{} has moved", dir.display()));
+        }
+    }
+    real_dir(&git_dir.join("aivyx"))?;
+    for sub in [
+        "objects",
+        "objects/info",
+        "objects/pack",
+        "refs",
+        "refs/aivyx",
+        "refs/aivyx/checkpoints",
+        "logs",
+        "logs/refs",
+        "logs/refs/aivyx",
+        "logs/refs/aivyx/checkpoints",
+    ] {
+        real_dir(&common_dir.join(sub))?;
+    }
+    if std::fs::symlink_metadata(common_dir.join("objects/info/alternates")).is_ok() {
+        return Err("the repository borrows objects from another (objects/info/alternates)".into());
+    }
+    for dir in [
+        "objects",
+        "refs/aivyx/checkpoints",
+        "logs/refs/aivyx/checkpoints",
+    ] {
+        let dir = common_dir.join(dir);
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("{}: {e}", dir.display()))?;
+            if entry.file_type().is_ok_and(|t| t.is_symlink()) {
+                return Err(format!("{} is a symbolic link", entry.path().display()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `Ok(true)` for a real directory, `Ok(false)` when nothing is there, and
+/// an error for a symbolic link or anything else — never followed.
+fn real_dir(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            Err(format!("{} is a symbolic link", path.display()))
+        }
+        Ok(m) if m.is_dir() => Ok(true),
+        Ok(_) => Err(format!("{} is not a directory", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(format!("{}: {e}", path.display())),
+    }
+}
+
+/// A full hexadecimal object id (SHA-1 or SHA-256), not an abbreviation.
+fn is_full_object_id(name: &str) -> bool {
+    matches!(name.len(), 40 | 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+/// Finds the repository for `cwd` at detection: its git directory, common
+/// directory and work tree, canonicalised. Refuses (an error) a git
+/// directory that is neither `<work tree>/.git` nor a linked worktree whose
+/// `gitdir` file points back at `<work tree>/.git` — a `.git` file a
+/// confined process planted would otherwise point the checkpoint's writes
+/// at another repository — and a layout [`check_layout`] refuses. The
+/// query itself goes through [`run_git`], so a repository whose config is
+/// outside the allow-list (e.g. `core.worktree`) is refused here too.
+async fn locate(cwd: &Path) -> Result<(PathBuf, PathBuf, PathBuf), String> {
+    let out = run_git(
+        cwd,
+        &[
+            "rev-parse",
+            "--path-format=absolute",
+            "--absolute-git-dir",
+            "--git-common-dir",
+            "--show-toplevel",
+        ],
+        &[],
+    )
+    .await?;
+    let mut lines = out.lines();
+    let mut next = |what: &str| -> Result<PathBuf, String> {
+        let line = lines
+            .next()
+            .filter(|l| !l.is_empty())
+            .ok_or_else(|| format!("git did not report the {what}"))?;
+        PathBuf::from(line)
+            .canonicalize()
+            .map_err(|e| format!("{line}: {e}"))
+    };
+    let git_dir = next("git directory")?;
+    let common_dir = next("common git directory")?;
+    let work_tree = next("work tree")?;
+    let canonical_cwd = cwd.canonicalize().map_err(|e| e.to_string())?;
+    if !canonical_cwd.starts_with(&work_tree) {
+        return Err(format!(
+            "{} is outside its work tree {}",
+            cwd.display(),
+            work_tree.display()
+        ));
+    }
+    let dot_git = work_tree.join(".git");
+    if git_dir != dot_git {
+        let points_back = std::fs::read_to_string(git_dir.join("gitdir"))
+            .ok()
+            .and_then(|back| PathBuf::from(back.trim()).canonicalize().ok())
+            .is_some_and(|back| Some(back) == dot_git.canonicalize().ok());
+        if !points_back {
+            return Err(format!(
+                "the git directory {} belongs to neither {} nor a linked worktree of it",
+                git_dir.display(),
+                work_tree.display()
+            ));
+        }
+    }
+    check_layout(&git_dir, &common_dir)?;
+    Ok((git_dir, common_dir, work_tree))
 }
 
 /// Builds `:(exclude)` pathspecs for every deny path inside `cwd`, relative
@@ -502,181 +789,465 @@ fn is_bare_deny_pattern(path: &Path) -> bool {
     path.parent() == Some(Path::new(""))
 }
 
-/// Always passed to unconfined git: no fsmonitor, no hooks (plumbing like
-/// `update-ref` runs `reference-transaction`), no commit signing.
-const SAFE_GIT_CONFIG: [&str; 6] = [
+/// Always passed to unconfined git, whatever the repository's config says
+/// (a second layer under [`check_repo_config`]'s allow-list): no fsmonitor,
+/// no hooks (plumbing like `update-ref` runs `reference-transaction`), no
+/// signing, no network transport of any kind (which also stops a lazy
+/// fetch), and no recursion into submodules, whose own config is not
+/// checked.
+const SAFE_GIT_CONFIG: [&str; 12] = [
     "-c",
     "core.fsmonitor=false",
     "-c",
     "core.hooksPath=/dev/null",
     "-c",
     "commit.gpgSign=false",
+    "-c",
+    "tag.gpgSign=false",
+    "-c",
+    "protocol.allow=never",
+    "-c",
+    "submodule.recurse=false",
 ];
 
-/// The `git config` query listing filter drivers defined in the
-/// repository's own config for one scope (`--local` / `--worktree`).
-const REPO_FILTER_QUERY: [&str; 5] = [
+/// Environment set on every git this crate spawns: replace refs are
+/// ignored (a confined command could otherwise swap the content behind an
+/// object id), a missing object is never fetched from a promisor remote,
+/// and git never prompts.
+const HARDENED_ENV: [(&str, &str); 3] = [
+    ("GIT_NO_REPLACE_OBJECTS", "1"),
+    ("GIT_NO_LAZY_FETCH", "1"),
+    ("GIT_TERMINAL_PROMPT", "0"),
+];
+
+/// Lists every config entry git will use, with its scope and origin, so
+/// [`check_repo_config`] can tell the repository's own entries (which a
+/// confined process can write) from the user's.
+const CONFIG_LISTING: [&str; 6] = [
     "config",
+    "--list",
     "--includes",
-    "--name-only",
-    "--get-regexp",
-    r"^filter\..+\.(clean|smudge|process)$",
+    "--show-scope",
+    "--show-origin",
+    "-z",
 ];
 
-fn repo_filter_query(scope: &'static str) -> Vec<&'static str> {
-    let mut args: Vec<&str> = SAFE_GIT_CONFIG.to_vec();
-    args.push(REPO_FILTER_QUERY[0]);
-    args.push(scope);
-    args.extend(&REPO_FILTER_QUERY[1..]);
-    args
+#[cfg(test)]
+thread_local! {
+    /// Test-only: accept any repository config, so a test can show that
+    /// the second layer (the fixed `-c` overrides, the hardened
+    /// environment, the explicit work tree) holds on its own.
+    static ACCEPT_ANY_REPO_CONFIG: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// `-c` overrides switching off every filter driver whose keys appear in
-/// `listings` (the output of [`repo_filter_query`], one listing per scope).
-fn filter_overrides<'a>(listings: impl IntoIterator<Item = &'a str>) -> Vec<String> {
-    let mut drivers: Vec<String> = Vec::new();
-    for key in listings.into_iter().flat_map(str::lines) {
-        if let Some(driver) = key
-            .strip_prefix("filter.")
-            .and_then(|rest| rest.rsplit_once('.'))
-            .map(|(driver, _)| driver.to_string())
-            && !drivers.contains(&driver)
-        {
-            drivers.push(driver);
+/// Settings the repository's own config may hold. Everything else makes
+/// [`check_repo_config`] refuse to run git: a list of what to forbid could
+/// never be complete (git keeps adding settings that run a program or reach
+/// a remote), so this lists what is known to be harmless for the commands
+/// this crate and its consumers run unconfined. `key` is as `git config
+/// --list` prints it: section and name lower-case, a subsection as written.
+fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
+    let Some((section, rest)) = key.split_once('.') else {
+        return false;
+    };
+    let (subsection, name) = match rest.rsplit_once('.') {
+        Some((subsection, name)) => (Some(subsection), name),
+        None => (None, rest),
+    };
+    let is_false = |v: Option<&str>| {
+        v.is_some_and(|v| {
+            ["false", "no", "off", "0"]
+                .iter()
+                .any(|f| v.eq_ignore_ascii_case(f))
+        })
+    };
+    match (section, subsection) {
+        ("core", None) => match name {
+            // Version 1 only matters with extensions, which are listed below.
+            "repositoryformatversion" => matches!(value, Some("0" | "1")),
+            "bare" => is_false(value),
+            // Both always switched off by `SAFE_GIT_CONFIG`.
+            "fsmonitor" | "hookspath" => true,
+            _ => [
+                "filemode",
+                "logallrefupdates",
+                "ignorecase",
+                "precomposeunicode",
+                "symlinks",
+                "autocrlf",
+                "safecrlf",
+                "eol",
+                "quotepath",
+                "checkstat",
+                "trustctime",
+                "ignorestat",
+                "untrackedcache",
+                "splitindex",
+                "preloadindex",
+                "fscache",
+                "compression",
+                "loosecompression",
+                "bigfilethreshold",
+                "abbrev",
+                "commentchar",
+                "commentstring",
+                "whitespace",
+                "sparsecheckout",
+                "sparsecheckoutcone",
+                "warnambiguousrefs",
+                "multipackindex",
+                "commitgraph",
+                "deltabasecachelimit",
+                "packedgitwindowsize",
+                "packedgitlimit",
+                "fsync",
+                "fsyncmethod",
+                "fsyncobjectfiles",
+                "filesreflocktimeout",
+                "packedrefstimeout",
+                "longpaths",
+                "hidedotfiles",
+                "fsmonitorhookversion",
+                "checkroundtripencoding",
+            ]
+            .contains(&name),
+        },
+        // What `git init`, `git worktree` and `git sparse-checkout` write;
+        // a partial clone (`partialclone`) and any other extension are not
+        // allowed.
+        ("extensions", None) => ["objectformat", "refstorage", "worktreeconfig"].contains(&name),
+        ("remote", Some(_)) => [
+            "url",
+            "pushurl",
+            "fetch",
+            "push",
+            "tagopt",
+            "mirror",
+            "prune",
+            "prunetags",
+            "skipdefaultupdate",
+            "skipfetchall",
+            "followremotehead",
+            "gh-resolved",
+        ]
+        .contains(&name),
+        // Upstream tracking and editor bookkeeping only.
+        ("branch", Some(_)) => true,
+        ("user", None) => ["name", "email", "signingkey", "useconfigonly"].contains(&name),
+        ("author" | "committer", None) => ["name", "email"].contains(&name),
+        // Signing is always switched off by `SAFE_GIT_CONFIG`.
+        ("commit", None) => ["gpgsign", "verbose", "status", "cleanup"].contains(&name),
+        ("tag", None) => ["gpgsign", "sort"].contains(&name),
+        // Programs switched off by [`repo_overrides`]; signing is off anyway.
+        ("gpg", None) => ["format", "program"].contains(&name),
+        ("gpg", Some(_)) => name == "program",
+        // Programs switched off by [`repo_overrides`].
+        ("filter", Some(_)) => ["clean", "smudge", "process", "required"].contains(&name),
+        ("lfs", None) => ["repositoryformatversion", "locksverify"].contains(&name),
+        ("lfs", Some(_)) => ["access", "locksverify"].contains(&name),
+        ("submodule", None) => ["recurse", "active"].contains(&name),
+        ("submodule", Some(_)) => [
+            "url",
+            "active",
+            "branch",
+            "ignore",
+            "shallow",
+            "fetchrecursesubmodules",
+        ]
+        .contains(&name),
+        ("pull", None) => ["rebase", "ff"].contains(&name),
+        ("push", None) => ["default", "autosetupremote", "followtags"].contains(&name),
+        ("fetch", None) => ["prune", "prunetags"].contains(&name),
+        ("rebase", None) => ["autosquash", "autostash", "updaterefs"].contains(&name),
+        ("merge", None) => ["ff", "conflictstyle"].contains(&name),
+        ("diff", None) => [
+            "renames",
+            "algorithm",
+            "colormoved",
+            "mnemonicprefix",
+            "noprefix",
+            // Switched off by [`repo_overrides`] (git-crypt, for one, sets a
+            // repository textconv driver).
+            "external",
+        ]
+        .contains(&name),
+        ("diff", Some(_)) => [
+            // Programs switched off by [`repo_overrides`].
+            "textconv",
+            "command",
+            "cachetextconv",
+            "binary",
+            "xfuncname",
+            "funcname",
+            "wordregex",
+        ]
+        .contains(&name),
+        ("status", None) => [
+            "showuntrackedfiles",
+            "submodulesummary",
+            "relativepaths",
+            "short",
+            "branch",
+            "showstash",
+            "aheadbehind",
+        ]
+        .contains(&name),
+        ("log", None) => ["decorate", "date", "follow", "abbrevcommit"].contains(&name),
+        ("color" | "advice", _) => true,
+        ("gui", None) => ["wmstate", "geometry"].contains(&name),
+        ("i18n", None) => ["commitencoding", "logoutputencoding"].contains(&name),
+        ("init", None) => name == "defaultbranch",
+        ("rerere", None) => ["enabled", "autoupdate"].contains(&name),
+        ("gc", None) => [
+            "auto",
+            "autodetach",
+            "autopacklimit",
+            "pruneexpire",
+            "reflogexpire",
+            "reflogexpireunreachable",
+            "writecommitgraph",
+        ]
+        .contains(&name),
+        ("maintenance", None) => ["auto", "strategy"].contains(&name),
+        ("index", None) => [
+            "version",
+            "threads",
+            "skiphash",
+            "sparse",
+            "recordendofindexentries",
+            "recordoffsettable",
+        ]
+        .contains(&name),
+        ("feature", None) => ["manyfiles", "experimental"].contains(&name),
+        ("blame", None) => [
+            "ignorerevsfile",
+            "markignoredlines",
+            "markunblamablelines",
+            "date",
+            "coloring",
+        ]
+        .contains(&name),
+        ("checkout", None) => [
+            "defaultremote",
+            "workers",
+            "thresholdforparallelism",
+            "guess",
+        ]
+        .contains(&name),
+        ("worktree", None) => name == "guessremote",
+        ("splitindex", None) => ["maxpercentchange", "sharedindexexpire"].contains(&name),
+        ("apply", None) => name == "whitespace",
+        _ => false,
+    }
+}
+
+/// Checks a [`CONFIG_LISTING`] of the config git will use in `cwd`, and
+/// returns the `-c` overrides switching off every program the
+/// repository's own config names (see [`repo_overrides`]).
+///
+/// The repository's own entries — `.git/config`, a worktree's
+/// `config.worktree`, anything they include, and any config file that
+/// lies inside `cwd` — can be written by a confined process, since `.git`
+/// sits inside the directory it may write under. Each such entry must be
+/// on [`allowed_repo_setting`]'s allow-list, or this returns an error
+/// naming the settings (never their values, which an include could have
+/// read from anywhere). The user's own system and global config, and `-c`
+/// settings, are trusted and left alone (so git-lfs or a global excludes
+/// file keep working).
+fn check_repo_config(listing: &[u8], cwd: &Path) -> Result<Vec<String>, String> {
+    let listing = String::from_utf8_lossy(listing);
+    let mut fields = listing.split('\0');
+    let mut refused: Vec<String> = Vec::new();
+    let mut programs: Vec<String> = Vec::new();
+    while let (Some(scope), Some(origin), Some(entry)) =
+        (fields.next(), fields.next(), fields.next())
+    {
+        let (key, value) = match entry.split_once('\n') {
+            Some((key, value)) => (key, Some(value)),
+            None => (entry, None),
+        };
+        let inside_cwd = origin
+            .strip_prefix("file:")
+            .is_some_and(|file| cwd.join(file).starts_with(cwd));
+        let repository_controlled = match scope {
+            "system" | "global" => inside_cwd,
+            "command" => false,
+            _ => true,
+        };
+        if !repository_controlled {
+            continue;
+        }
+        if !programs.iter().any(|k| k == key) {
+            programs.push(key.to_string());
+        }
+        #[cfg(test)]
+        if ACCEPT_ANY_REPO_CONFIG.with(std::cell::Cell::get) {
+            continue;
+        }
+        if !allowed_repo_setting(key, value) && !refused.iter().any(|k| k == key) {
+            refused.push(key.to_string());
         }
     }
-    drivers
-        .iter()
-        .flat_map(|driver| {
-            ["clean", "smudge", "process"]
-                .into_iter()
-                .map(move |kind| format!("filter.{driver}.{kind}="))
-                .chain(std::iter::once(format!("filter.{driver}.required=false")))
-        })
+    if refused.is_empty() {
+        Ok(repo_overrides(&programs))
+    } else {
+        Err(format!(
+            "the repository's git config sets {}, which git run outside the \
+             sandbox must not honour; remove {} to re-enable checkpoints",
+            refused.join(", "),
+            if refused.len() == 1 { "it" } else { "them" }
+        ))
+    }
+}
+
+/// `-c` overrides switching off every program named by the repository's
+/// own config `keys` (each an allowed key, as listed): its filter drivers
+/// (`filter.<d>.clean`/`smudge`/`process` emptied, `required` off), its
+/// diff drivers and external diff (`diff.<d>.textconv`/`command`,
+/// `diff.external` emptied — git then refuses such a diff instead of
+/// running anything; callers pass `--no-ext-diff --no-textconv` and never
+/// notice) and its signing programs (`gpg.program`, `gpg.<format>.program`
+/// emptied; signing itself is off in `SAFE_GIT_CONFIG`). The user's own
+/// global and system drivers are not in `keys` and keep working.
+fn repo_overrides(keys: &[String]) -> Vec<String> {
+    let mut settings: Vec<String> = Vec::new();
+    let mut add = |setting: String| {
+        if !settings.contains(&setting) {
+            settings.push(setting);
+        }
+    };
+    for key in keys {
+        let Some((section, rest)) = key.split_once('.') else {
+            continue;
+        };
+        let subsection = rest.rsplit_once('.').map(|(subsection, _)| subsection);
+        match (section, subsection) {
+            ("filter", Some(driver)) => {
+                for kind in ["clean", "smudge", "process"] {
+                    add(format!("filter.{driver}.{kind}="));
+                }
+                add(format!("filter.{driver}.required=false"));
+            }
+            ("diff", Some(driver)) => {
+                add(format!("diff.{driver}.textconv="));
+                add(format!("diff.{driver}.command="));
+            }
+            ("diff", None) if rest == "external" => add("diff.external=".into()),
+            ("gpg", None) if rest == "program" => add("gpg.program=".into()),
+            ("gpg", Some(format)) if rest.ends_with(".program") => {
+                add(format!("gpg.{format}.program="))
+            }
+            _ => {}
+        }
+    }
+    settings
+        .into_iter()
         .flat_map(|setting| ["-c".to_string(), setting])
         .collect()
 }
 
-/// `-c` overrides that switch off every filter driver defined in the
-/// *repository's own* config (`.git/config`, its includes, and a
-/// worktree's `config.worktree`) — the config a confined process can write,
-/// since `.git` sits inside the directory it may write under. A clean,
-/// smudge or process filter there would otherwise run with this crate's
-/// unconfined privileges on `add`/`read-tree`. Filters from the user's own
-/// global or system config (git-lfs, say) are trusted and left alone.
-/// Reading config runs nothing; a query that finds no matching keys (exit
-/// status 1 — `--get-regexp`'s documented "not found" status, the normal
-/// case for a repository with no filters configured) means nothing to
-/// switch off for that scope, and neither does a query that finds no
-/// repository at all to query — the bootstrapping case, e.g.
-/// `GitCheckpointer::detect`'s own first probe, or a `git init` call that's
-/// about to create one, as `test_support::init_repo` makes first. git
-/// reports that case with a specific, stable fatal message for each scope's
-/// own flag (`"--local can only be used inside a git repository"` /
-/// `"--worktree can only be used inside a git repository"`), checked
-/// directly against *this* query's own result rather than via a separate
-/// pre-check — deciding "is cwd inside a repository" any other way (e.g.
-/// walking `cwd`'s ancestors for a `.git` entry) would miss `GIT_DIR`/
-/// `GIT_WORK_TREE`, which git itself honours and which `envs` (or the
-/// ambient process environment, inherited by the spawned command either
-/// way) can set to point at a repository nowhere in `cwd`'s own ancestry.
-/// Any other failure — a malformed or unreadable config file, the query
-/// timing out, failing to spawn `git` at all — is a real error and is
-/// returned as one rather than silently treated the same as "no filters":
-/// this is the query that decides whether a repo-defined filter driver gets
-/// neutralised before running with this crate's unconfined privileges, so
-/// continuing with no overrides when the query itself couldn't be trusted
-/// would risk running one unneutralised.
+/// Checks the config git will use in `cwd` (with `envs`, so `GIT_DIR` and
+/// `GIT_WORK_TREE` are honoured exactly as the real invocation honours
+/// them) and returns the `-c` overrides that switch off the programs the
+/// repository's own config names (see [`repo_overrides`]). An error when the repository's config holds a
+/// setting outside the allow-list (see [`check_repo_config`]), and when the
+/// config can't be read at all (a malformed or unreadable file, a timeout):
+/// running unconfined git on a config this couldn't check would defeat
+/// the check. Outside any repository git lists only the user's own config,
+/// which is the bootstrapping case (`detect`'s first probe, a `git init`).
 async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec<String>, String> {
-    let mut listings = Vec::new();
-    for scope in ["--local", "--worktree"] {
-        let mut command = tokio::process::Command::new("git");
-        command
-            .args(repo_filter_query(scope))
-            .current_dir(cwd)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .kill_on_drop(true);
-        for (key, value) in envs {
-            command.env(key, value);
-        }
-        // The "no repository here" case below is recognised by git's own
-        // message, so keep that message untranslated whatever the user's
-        // locale.
-        command.env("LC_ALL", "C").env("LANGUAGE", "");
-        let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
-            .await
-            .map_err(|_| format!("git config --get-regexp ({scope}) timed out"))?
-            .map_err(|e| format!("failed to run git config ({scope}): {e}"))?;
-        if output.status.success() {
-            listings.push(String::from_utf8_lossy(&output.stdout).into_owned());
-        } else if output.status.code() != Some(1) {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            let no_repository_here =
-                stderr.contains(&format!("{scope} can only be used inside a git repository"));
-            if !no_repository_here {
-                return Err(format!(
-                    "git config --get-regexp ({scope}) failed: {}",
-                    stderr.trim()
-                ));
-            }
-        }
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(CONFIG_LISTING)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .envs(HARDENED_ENV);
+    for (key, value) in envs {
+        command.env(key, value);
     }
-    Ok(filter_overrides(listings.iter().map(String::as_str)))
+    command.env("LC_ALL", "C").env("LANGUAGE", "");
+    let output = tokio::time::timeout(GIT_TIMEOUT, command.output())
+        .await
+        .map_err(|_| "git config --list timed out".to_string())?
+        .map_err(|e| format!("failed to run git config: {e}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git config --list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    check_repo_config(&output.stdout, cwd)
 }
 
 /// The arguments to put before the subcommand of any *blocking*, unconfined
 /// git a caller spawns itself (a preview, a branch-name lookup): the same
-/// protections [`run_git`] applies — no fsmonitor, hooks or signing, and the
-/// repository's own filter drivers switched off. Diff callers still add
-/// `--no-ext-diff --no-textconv` to the diff itself.
-pub fn unconfined_git_args_blocking(cwd: &Path) -> Vec<String> {
-    let mut args: Vec<String> = SAFE_GIT_CONFIG.iter().map(|s| s.to_string()).collect();
-    let listings: Vec<String> = ["--local", "--worktree"]
-        .into_iter()
-        .filter_map(|scope| {
-            let mut command = std::process::Command::new("git");
-            command
-                .args(repo_filter_query(scope))
-                .current_dir(cwd)
-                .stdin(std::process::Stdio::null())
-                .stderr(std::process::Stdio::null());
-            blocking_output_within(command, GIT_TIMEOUT)
-                .map(|out| String::from_utf8_lossy(&out).into_owned())
-        })
-        .collect();
-    args.extend(filter_overrides(listings.iter().map(String::as_str)));
-    args
+/// protections [`run_git`] applies — the repository's config checked
+/// against the allow-list, no fsmonitor, hooks, signing or transport,
+/// replace refs ignored, and the programs the repository's own config
+/// names (filter and diff drivers, signing programs) switched off. An error when the config holds a setting outside the allow-list or
+/// can't be read; the caller must then not run git at all. Diff callers
+/// still add `--no-ext-diff --no-textconv` to the diff itself, and should
+/// set [`HARDENED_ENV`]'s `GIT_NO_LAZY_FETCH=1` where they can.
+pub fn unconfined_git_args_blocking(cwd: &Path) -> Result<Vec<String>, String> {
+    let mut command = std::process::Command::new("git");
+    command
+        .args(CONFIG_LISTING)
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .envs(HARDENED_ENV)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "");
+    let output = blocking_output_within(command, GIT_TIMEOUT)
+        .ok_or("git config --list timed out or could not start")?;
+    if !output.status.success() {
+        return Err(format!(
+            "git config --list failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    let overrides = check_repo_config(&output.stdout, cwd)?;
+    let mut args = vec!["--no-replace-objects".to_string()];
+    args.extend(SAFE_GIT_CONFIG.iter().map(|s| s.to_string()));
+    args.extend(overrides);
+    Ok(args)
 }
 
 /// Runs `command` to completion, killing it and returning `None` if it
-/// doesn't finish within `timeout`. The one blocking (non-tokio) process
-/// invocation this crate makes — [`run_git`]'s own async path already gets
-/// a bound from `tokio::time::timeout`; this gives
-/// [`unconfined_git_args_blocking`]'s config queries the same [`GIT_TIMEOUT`]
-/// bound rather than running unbounded. Polls with `try_wait` instead of a
-/// watcher thread so there's nothing else to clean up on the success path;
-/// stdout is only read after the child has exited, which is fine for the
-/// short config-key listings this is used for, but would risk a pipe-buffer
-/// deadlock for a command with substantial output.
+/// doesn't finish within `timeout` (or can't be started). The one blocking
+/// (non-tokio) process invocation this crate makes — [`run_git`]'s own
+/// async path already gets a bound from `tokio::time::timeout`; this gives
+/// [`unconfined_git_args_blocking`]'s config query the same [`GIT_TIMEOUT`]
+/// bound rather than running unbounded. stdout and stderr are drained on
+/// their own threads, so a large listing can't fill a pipe and stall the
+/// child until the timeout.
 fn blocking_output_within(
     mut command: std::process::Command,
     timeout: Duration,
-) -> Option<Vec<u8>> {
-    command.stdout(std::process::Stdio::piped());
-    let mut child = command.spawn().ok()?;
-    let start = std::time::Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(_status)) => {
-                let mut buf = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read;
-                    let _ = out.read_to_end(&mut buf);
-                }
-                return Some(buf);
+) -> Option<std::process::Output> {
+    fn drain(
+        pipe: Option<impl std::io::Read + Send + 'static>,
+    ) -> std::thread::JoinHandle<Vec<u8>> {
+        std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut buf);
             }
+            buf
+        })
+    }
+    command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = command.spawn().ok()?;
+    let stdout = drain(child.stdout.take());
+    let stderr = drain(child.stderr.take());
+    let start = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if start.elapsed() >= timeout {
                     let _ = child.kill();
@@ -685,24 +1256,37 @@ fn blocking_output_within(
                 }
                 std::thread::sleep(Duration::from_millis(10));
             }
-            Err(_) => return None,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
         }
-    }
+    };
+    Some(std::process::Output {
+        status,
+        stdout: stdout.join().ok()?,
+        stderr: stderr.join().ok()?,
+    })
 }
 
-/// One plumbing invocation:/// One plumbing invocation: trusted fixed argv (never model-controlled),
+/// One plumbing invocation: trusted fixed argv (never model-controlled),
 /// writing only under `.git`, so it runs unconfined; `kill_on_drop` +
 /// timeout bound it instead. `pub` because it has a consumer beyond this
 /// file: `aivyx-coder`'s own `wiki.rs` module calls this directly,
 /// cross-crate, for its own (unrelated) git plumbing needs.
 ///
-/// Because it is unconfined, it never runs a program the repository's own
-/// config names — a confined process can write `.git/config`, `.git/hooks`
-/// and `.gitattributes`, since `.git` lies inside the directory it may write
-/// under. So fsmonitor and hooks are off, commit signing is off, and every
-/// filter driver defined in the repository's own config is switched off
-/// (see [`repo_program_overrides`]). Diff drivers only run for diffs:
-/// callers that diff pass `--no-ext-diff --no-textconv` themselves.
+/// Because it is unconfined, it must not let the repository steer it — a
+/// confined process can write `.git/config`, `.git/hooks` and
+/// `.gitattributes`, since `.git` lies inside the directory it may write
+/// under. Two layers: the repository's own config must hold only settings
+/// on an allow-list, checked before every invocation (see
+/// [`check_repo_config`]; an error otherwise), and every invocation runs
+/// with fsmonitor, hooks, signing, network transport and submodule
+/// recursion switched off, replace refs ignored, lazy fetching disabled and
+/// the programs the repository's own config names switched off (filter and
+/// diff drivers, signing programs; see [`repo_overrides`]). Callers that
+/// diff still pass `--no-ext-diff --no-textconv` themselves.
 pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result<String, String> {
     let neutralise = repo_program_overrides(cwd, envs).await?;
     let mut command = tokio::process::Command::new("git");
@@ -714,7 +1298,8 @@ pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true);
+        .kill_on_drop(true)
+        .envs(HARDENED_ENV);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -751,8 +1336,13 @@ pub mod test_support {
     use super::run_git;
     use std::path::Path;
 
+    /// [`run_git`], plus the local `file` transport (which `run_git`
+    /// switches off with every other one), so fixtures can push to a bare
+    /// repository in a temp directory.
     pub async fn git(dir: &Path, args: &[&str]) -> String {
-        run_git(dir, args, &[])
+        let mut argv = vec!["-c", "protocol.file.allow=always"];
+        argv.extend_from_slice(args);
+        run_git(dir, &argv, &[])
             .await
             .unwrap_or_else(|err| panic!("git {args:?}: {err}"))
     }
@@ -932,9 +1522,30 @@ mod tests {
 
     #[test]
     fn filter_overrides_switch_off_every_listed_driver_once() {
-        let local = "filter.evil.clean\nfilter.evil.smudge\nfilter.with.dots.process\n";
-        let worktree = "filter.evil.clean\n";
-        let args = filter_overrides([local, worktree]);
+        let listed = listing(&[
+            ("local", "file:.git/config", "filter.evil.clean", Some("x")),
+            ("local", "file:.git/config", "filter.evil.smudge", Some("x")),
+            (
+                "local",
+                "file:.git/config",
+                "filter.with.dots.process",
+                Some("x"),
+            ),
+            (
+                "worktree",
+                "file:.git/config.worktree",
+                "filter.evil.clean",
+                Some("x"),
+            ),
+            // The user's own (git-lfs, say) is trusted and left alone.
+            (
+                "global",
+                "file:/home/u/.gitconfig",
+                "filter.lfs.clean",
+                Some("x"),
+            ),
+        ]);
+        let args = check_repo_config(&listed, Path::new("/repo")).unwrap();
         let settings: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
         assert_eq!(
             settings,
@@ -950,7 +1561,20 @@ mod tests {
             ]
         );
         assert!(args.iter().step_by(2).all(|a| a == "-c"));
-        assert!(filter_overrides([""]).is_empty());
+        assert!(repo_overrides(&[]).is_empty());
+    }
+
+    /// A `git config --list --show-scope --show-origin -z` listing.
+    fn listing(entries: &[(&str, &str, &str, Option<&str>)]) -> Vec<u8> {
+        let mut out = String::new();
+        for (scope, origin, key, value) in entries {
+            out.push_str(&format!("{scope}\0{origin}\0{key}"));
+            if let Some(value) = value {
+                out.push_str(&format!("\n{value}"));
+            }
+            out.push('\0');
+        }
+        out.into_bytes()
     }
 
     #[tokio::test]
@@ -961,7 +1585,7 @@ mod tests {
         run_git(&cwd, &["config", "filter.evil.clean", "touch x"], &[])
             .await
             .unwrap();
-        let args = unconfined_git_args_blocking(&cwd);
+        let args = unconfined_git_args_blocking(&cwd).unwrap();
         for needed in [
             "core.fsmonitor=false",
             "core.hooksPath=/dev/null",
@@ -1789,5 +2413,513 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(got, want.trim());
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_private_index_dir_is_not_written_through() {
+        // `.git` lies inside the directory a confined command may write, so
+        // it can replace `.git/aivyx` with a symlink to any directory.
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let cp = GitCheckpointer::detect(repo.path(), vec![]).await.unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".git/aivyx")).unwrap();
+
+        let result = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await;
+
+        let written: Vec<_> = std::fs::read_dir(outside.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert!(
+            written.is_empty(),
+            "unconfined git wrote outside the work tree: {written:?}"
+        );
+        assert!(result.is_err(), "the checkpoint must fail, not succeed");
+        assert!(
+            GitCheckpointer::detect(repo.path(), vec![]).await.is_none(),
+            "detection refuses the planted layout too"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_lock_behind_a_symlinked_private_index_dir_is_not_deleted() {
+        let repo = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        init_repo(repo.path()).await;
+        let lock = outside.path().join("index.lock");
+        std::fs::write(&lock, "").unwrap();
+        let stale = std::time::SystemTime::now() - GIT_TIMEOUT - Duration::from_secs(5);
+        std::fs::File::open(&lock)
+            .unwrap()
+            .set_modified(stale)
+            .unwrap();
+        let cp = GitCheckpointer::detect(repo.path(), vec![]).await.unwrap();
+        std::os::unix::fs::symlink(outside.path(), repo.path().join(".git/aivyx")).unwrap();
+
+        let _ = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await;
+        assert!(lock.exists(), "a lock file was deleted through a symlink");
+    }
+
+    /// Plain git, as a confined command could run it.
+    fn plain_git(dir: &Path, args: &[&str]) {
+        let status = std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?}");
+    }
+
+    /// Runs `body` with the allow-list switched off, so only the second
+    /// layer (fixed overrides, hardened environment, explicit work tree)
+    /// protects the checkpoint.
+    async fn second_layer_only<F: std::future::Future<Output = ()>>(body: F) {
+        ACCEPT_ANY_REPO_CONFIG.with(|accept| accept.set(true));
+        body.await;
+        ACCEPT_ANY_REPO_CONFIG.with(|accept| accept.set(false));
+    }
+
+    #[tokio::test]
+    async fn without_the_allow_list_no_transport_or_lazy_fetch_runs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        std::fs::create_dir(&cwd).unwrap();
+        init_repo(&cwd).await;
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        let marker = tmp.path().join("MARKER");
+        for (key, value) in [
+            ("core.repositoryformatversion", "1".to_string()),
+            ("extensions.partialClone", "origin".into()),
+            ("remote.origin.promisor", "true".into()),
+            ("remote.origin.url", "ssh://example.invalid/x".into()),
+            (
+                "core.sshCommand",
+                format!("touch {}; false", marker.display()),
+            ),
+        ] {
+            plain_git(&cwd, &["config", key, &value]);
+        }
+        let head = run_git(&cwd, &["symbolic-ref", "HEAD"], &[])
+            .await
+            .unwrap_err();
+        assert!(head.contains("sshcommand"), "the allow-list is on: {head}");
+        std::fs::write(
+            cwd.join(".git/refs/heads/main"),
+            "1111111111111111111111111111111111111111\n",
+        )
+        .unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+
+        second_layer_only(async {
+            // Fails on the missing parent instead of fetching it.
+            let _ = cp
+                .try_checkpoint("edit_file", &CancellationToken::new())
+                .await;
+        })
+        .await;
+        assert!(!marker.exists(), "a transport command ran");
+    }
+
+    #[tokio::test]
+    async fn without_the_allow_list_the_work_tree_is_still_the_detected_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cwd = tmp.path().join("proj");
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir(&cwd).unwrap();
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("id_ed25519"), "SECRETKEY").unwrap();
+        std::fs::write(secret.join("tracked.txt"), "keep me\n").unwrap();
+        init_repo(&cwd).await;
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        plain_git(&cwd, &["config", "core.worktree", secret.to_str().unwrap()]);
+        std::fs::write(cwd.join("tracked.txt"), "changed\n").unwrap();
+
+        second_layer_only(async {
+            let cancel = CancellationToken::new();
+            cp.try_checkpoint("edit_file", &cancel).await.unwrap();
+            let latest = cp.latest_ref(&cancel).await.unwrap();
+            let tree = cp
+                .git(
+                    &[
+                        "ls-tree".into(),
+                        "-r".into(),
+                        "--name-only".into(),
+                        latest.clone(),
+                    ],
+                    &[],
+                    &cancel,
+                )
+                .await
+                .unwrap();
+            assert!(!tree.contains("id_ed25519"), "{tree}");
+            assert!(tree.contains("tracked.txt"), "{tree}");
+            std::fs::write(cwd.join("tracked.txt"), "later\n").unwrap();
+            cp.restore_to(&latest, &cancel).await.unwrap();
+        })
+        .await;
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "changed\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(secret.join("tracked.txt")).unwrap(),
+            "keep me\n"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_repository_config_is_allowed() {
+        let local = |key: &'static str, value: &'static str| {
+            ("local", "file:.git/config", key, Some(value))
+        };
+        let listed = listing(&[
+            local("core.repositoryformatversion", "1"),
+            local("core.filemode", "true"),
+            local("core.bare", "false"),
+            local("core.logallrefupdates", "true"),
+            local("extensions.objectformat", "sha256"),
+            local("extensions.worktreeconfig", "true"),
+            local("remote.origin.url", "git@github.com:a/b.git"),
+            local("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            local("remote.upstream.gh-resolved", "base"),
+            local("branch.main.remote", "origin"),
+            local("branch.main.merge", "refs/heads/main"),
+            local("branch.feature.vscode-merge-base", "origin/main"),
+            local("user.email", "me@example.invalid"),
+            local("lfs.repositoryformatversion", "0"),
+            local("lfs.https://example.invalid/b.git/info/lfs.access", "basic"),
+            local("filter.lfs.clean", "git-lfs clean -- %f"),
+            local("filter.lfs.required", "true"),
+            local("diff.external", "/x"),
+            local("diff.git-crypt.textconv", "\"git-crypt\" diff"),
+            local("gpg.format", "ssh"),
+            local("gpg.program", "/x"),
+            local("gpg.ssh.program", "/x"),
+            local("submodule.vendor/lib.url", "https://example.invalid/lib"),
+            local("submodule.active", "."),
+            local("gui.wmstate", "normal"),
+            local("pull.rebase", "true"),
+            (
+                "worktree",
+                "file:.git/config.worktree",
+                "core.sparsecheckout",
+                Some("true"),
+            ),
+            (
+                "worktree",
+                "file:.git/config.worktree",
+                "core.sparsecheckoutcone",
+                Some("true"),
+            ),
+            // The user's own config is not checked.
+            (
+                "global",
+                "file:/home/u/.gitconfig",
+                "credential.helper",
+                Some("store"),
+            ),
+            ("command", "command line:", "core.sshcommand", Some("ssh")),
+        ]);
+        let args = check_repo_config(&listed, Path::new("/repo")).unwrap();
+        let settings: Vec<&str> = args.iter().skip(1).step_by(2).map(String::as_str).collect();
+        assert_eq!(
+            settings,
+            vec![
+                "filter.lfs.clean=",
+                "filter.lfs.smudge=",
+                "filter.lfs.process=",
+                "filter.lfs.required=false",
+                "diff.external=",
+                "diff.git-crypt.textconv=",
+                "diff.git-crypt.command=",
+                "gpg.program=",
+                "gpg.ssh.program=",
+            ]
+        );
+    }
+
+    #[test]
+    fn settings_outside_the_allow_list_are_refused_by_name_only() {
+        for (key, value) in [
+            ("core.sshcommand", Some("SECRET-VALUE")),
+            ("core.worktree", Some("SECRET-VALUE")),
+            ("core.bare", Some("SECRET-VALUE")),
+            ("core.bare", None),
+            ("core.repositoryformatversion", Some("SECRET-VALUE")),
+            ("core.pager", Some("SECRET-VALUE")),
+            ("core.editor", Some("SECRET-VALUE")),
+            ("core.excludesfile", Some("SECRET-VALUE")),
+            ("core.alternaterefscommand", Some("SECRET-VALUE")),
+            ("extensions.partialclone", Some("SECRET-VALUE")),
+            ("remote.origin.promisor", Some("SECRET-VALUE")),
+            ("remote.origin.uploadpack", Some("SECRET-VALUE")),
+            ("remote.origin.vcs", Some("SECRET-VALUE")),
+            ("include.path", Some("SECRET-VALUE")),
+            ("includeif.gitdir:/.path", Some("SECRET-VALUE")),
+            ("credential.helper", Some("SECRET-VALUE")),
+            ("gpg.ssh.defaultkeycommand", Some("SECRET-VALUE")),
+            ("diff.evil.unknown", Some("SECRET-VALUE")),
+            ("merge.evil.driver", Some("SECRET-VALUE")),
+            ("gc.recentobjectshook", Some("SECRET-VALUE")),
+            ("lfs.customtransfer.evil.path", Some("SECRET-VALUE")),
+            ("alias.st", Some("SECRET-VALUE")),
+            ("sequence.editor", Some("SECRET-VALUE")),
+            ("uploadpack.packobjectshook", Some("SECRET-VALUE")),
+            ("core.sharedrepository", Some("SECRET-VALUE")),
+        ] {
+            let listed = listing(&[("local", "file:.git/config", key, value)]);
+            let err = check_repo_config(&listed, Path::new("/repo")).unwrap_err();
+            assert!(err.contains(key), "{key}: {err}");
+            if value.is_some() {
+                assert!(
+                    !err.contains("SECRET-VALUE"),
+                    "{key} leaked its value: {err}"
+                );
+            }
+        }
+        // A global config file that lies inside the work tree is the
+        // repository's to write, so it is checked too.
+        let listed = listing(&[(
+            "global",
+            "file:/home/u/.gitconfig",
+            "core.sshcommand",
+            Some("x"),
+        )]);
+        assert!(check_repo_config(&listed, Path::new("/home/u")).is_err());
+        assert!(check_repo_config(&listed, Path::new("/home/u/proj")).is_ok());
+    }
+
+    #[tokio::test]
+    async fn run_git_and_the_blocking_args_refuse_a_disallowed_setting() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        plain_git(&cwd, &["config", "core.pager", "cat"]);
+        let err = run_git(&cwd, &["status"], &[]).await.unwrap_err();
+        assert!(err.contains("core.pager"), "{err}");
+        let err = unconfined_git_args_blocking(&cwd).unwrap_err();
+        assert!(err.contains("core.pager"), "{err}");
+        assert!(
+            GitCheckpointer::detect(&cwd, vec![]).await.is_none(),
+            "detection refuses it too"
+        );
+        plain_git(&cwd, &["config", "--unset", "core.pager"]);
+        assert!(GitCheckpointer::detect(&cwd, vec![]).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn repo_diff_drivers_are_allowed_but_never_run() {
+        // git-crypt and textconv setups put diff drivers in .git/config:
+        // checkpoints keep working, and no diff run through `run_git` can
+        // start one, even without `--no-ext-diff --no-textconv`.
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let marks = tempfile::tempdir().unwrap();
+        let (ext, ext_cmd) = marker_script(marks.path(), "ext");
+        let (conv, conv_cmd) = marker_script(marks.path(), "conv");
+        plain_git(&cwd, &["config", "diff.external", &ext_cmd]);
+        plain_git(&cwd, &["config", "diff.conv.textconv", &conv_cmd]);
+        plain_git(&cwd, &["config", "gpg.program", &ext_cmd]);
+        std::fs::write(cwd.join(".gitattributes"), "*.txt diff=conv\n").unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let _ = run_git(&cwd, &["diff"], &[]).await;
+        let _ = run_git(&cwd, &["log", "-p", "-1"], &[]).await;
+        let diff = run_git(&cwd, &["diff", "--no-ext-diff", "--no-textconv"], &[])
+            .await
+            .unwrap();
+        assert!(diff.contains("+v2"), "{diff}");
+        assert!(!ext.exists(), "a repo external diff ran unconfined");
+        assert!(!conv.exists(), "a repo textconv ran unconfined");
+    }
+
+    #[tokio::test]
+    async fn prune_deletes_a_planted_symbolic_ref_itself_not_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let planted = cwd.join(".git/refs/aivyx/checkpoints");
+        std::fs::create_dir_all(&planted).unwrap();
+        // Sorts first, so it is the first to be pruned.
+        plain_git(
+            &cwd,
+            &[
+                "symbolic-ref",
+                "refs/aivyx/checkpoints/0000000000000-0000000-0000",
+                "refs/heads/main",
+            ],
+        );
+        let mut cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        cp.set_retain(1);
+        std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        run_git(&cwd, &["rev-parse", "--verify", "refs/heads/main"], &[])
+            .await
+            .expect("the branch survives");
+        assert_eq!(checkpoint_refs(&cwd).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_symlinked_ref_or_object_directory_is_refused() {
+        for planted in ["refs/aivyx", "objects/ab", "logs/refs/aivyx"] {
+            let dir = tempfile::tempdir().unwrap();
+            let outside = tempfile::tempdir().unwrap();
+            init_repo(dir.path()).await;
+            let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+            let path = dir.path().join(".git").join(planted);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let _ = std::fs::remove_dir_all(&path);
+            std::os::unix::fs::symlink(outside.path(), &path).unwrap();
+            std::fs::write(dir.path().join("tracked.txt"), "v2\n").unwrap();
+            let err = cp
+                .try_checkpoint("write_file", &CancellationToken::new())
+                .await
+                .unwrap_err();
+            assert!(err.contains("symbolic link"), "{planted}: {err}");
+            assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn borrowed_objects_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        std::fs::write(
+            dir.path().join(".git/objects/info/alternates"),
+            format!("{}\n", other.path().display()),
+        )
+        .unwrap();
+        let err = cp
+            .try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap_err();
+        assert!(err.contains("alternates"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn a_planted_dot_git_file_is_not_followed() {
+        // A checkpointer detected earlier keeps using the git directory it
+        // found; a new one refuses a `.git` file pointing at a repository
+        // that isn't a linked worktree of this one.
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        init_repo(other.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        let real = cwd.join("real-git");
+        std::fs::rename(cwd.join(".git"), &real).unwrap();
+        std::fs::write(
+            cwd.join(".git"),
+            format!("gitdir: {}\n", other.path().join(".git").display()),
+        )
+        .unwrap();
+        assert!(GitCheckpointer::detect(&cwd, vec![]).await.is_none());
+        // The old git directory has moved, so the earlier one refuses.
+        assert!(
+            cp.try_checkpoint("write_file", &CancellationToken::new())
+                .await
+                .is_err()
+        );
+        assert!(
+            run_git(other.path(), &["for-each-ref", "refs/aivyx/"], &[])
+                .await
+                .unwrap()
+                .is_empty(),
+            "nothing was written into the other repository"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_linked_worktree_still_checkpoints_and_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let main = dir.path().canonicalize().unwrap();
+        let linked = main.parent().unwrap().join(format!(
+            "{}-linked",
+            main.file_name().unwrap().to_string_lossy()
+        ));
+        run_git(
+            &main,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "side",
+                linked.to_str().unwrap(),
+            ],
+            &[],
+        )
+        .await
+        .unwrap();
+        let cp = GitCheckpointer::detect(&linked, vec![]).await.unwrap();
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let good = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+        std::fs::write(linked.join("tracked.txt"), "broken\n").unwrap();
+        cp.restore_to(&good, &CancellationToken::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(linked.join("tracked.txt")).unwrap(),
+            "v1\n"
+        );
+        std::fs::remove_dir_all(&linked).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_subdirectory_checkpointer_snapshots_only_its_subtree() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("a.txt"), "a\n").unwrap();
+        let cp = GitCheckpointer::detect(&sub, vec![]).await.unwrap();
+        cp.try_checkpoint("write_file", &CancellationToken::new())
+            .await
+            .unwrap();
+        let latest = cp.latest_ref(&CancellationToken::new()).await.unwrap();
+        let tree = tree_of(dir.path(), &latest).await;
+        assert_eq!(tree.trim(), "sub/a.txt");
+    }
+
+    #[tokio::test]
+    async fn restore_to_accepts_a_full_object_id_but_no_other_name() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cp = GitCheckpointer::detect(dir.path(), vec![]).await.unwrap();
+        let cancel = CancellationToken::new();
+        cp.try_checkpoint("write_file", &cancel).await.unwrap();
+        let taken = cp.checkpoints();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            cp.latest_ref(&cancel).await.as_deref(),
+            Some(taken[0].ref_name.as_str())
+        );
+        std::fs::write(dir.path().join("tracked.txt"), "broken\n").unwrap();
+        for refused in ["main", "HEAD", &taken[0].commit[..12]] {
+            assert!(cp.restore_to(refused, &cancel).await.is_err(), "{refused}");
+        }
+        cp.restore_to(&taken[0].commit, &cancel).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("tracked.txt")).unwrap(),
+            "v1\n"
+        );
     }
 }

@@ -62,8 +62,8 @@ Single file, `lib.rs`:
 ### Checkpoint ref naming and retention
 
 `refs/aivyx/checkpoints/{millis:013}-{pid:07}-{seq:04}` — zero-padded
-millis sorts lexically == chronologically, which both `prune` (retention
-cutoff) and `latest_ref` (`.rfind`) rely on; the zero-padded pid comes next,
+millis sorts lexically == chronologically, which `prune` (retention
+cutoff) relies on; the zero-padded pid comes next,
 so refs sharing a millisecond still compare consistently. The pid keeps
 checkpoints from two processes sharing a repo distinct; `seq` alone can't,
 since each process's `GitCheckpointer` starts its own `seq` at 0. Shorter
@@ -74,6 +74,18 @@ name beyond treating it as one lexically-sortable string. `RETAIN` (default
 deletes the oldest refs beyond that count — deleting the ref is enough, the
 underlying commit/tree objects become unreferenced and age out via normal
 `git gc`.
+
+`latest_ref`, `checkpoints()` and `restore_to` never read refs back from
+the repository: each `GitCheckpointer` records the checkpoints it took
+(ref, commit, tree) in memory, at most `RETAIN` of them, and those are the
+only names `restore_to` accepts — restored to the recorded commit even if
+the ref has since moved. A full object id is accepted too (aivyx-coder's
+`/undo` keeps commit ids across sessions). Refs under
+`refs/aivyx/checkpoints/` can be written by a confined process, so a name
+that merely sorts last must never be taken for a checkpoint. Refs are
+created with `update-ref --no-deref <ref> <commit> ""` (fails if anything
+is already there) and pruned with `--no-deref -d`, so a planted symbolic
+ref is never followed to a branch.
 
 ### Generated files
 
@@ -89,7 +101,7 @@ paths are removed from the private index (`rm --cached -f`, since entries an
 earlier snapshot staged would otherwise keep being updated) and excluded
 from `add -A`. Restore therefore leaves them alone, like gitignored files.
 
-### Private-index lock and config-query reliability
+### Private-index lock
 
 `checkpoint`/`restore_to` both stage into the private index
 (`<git-dir>/aivyx/index`) via `GitCheckpointer::private_index`, which
@@ -100,19 +112,52 @@ can't belong to a call still in progress; without clearing it, every later
 checkpoint fails against the same lock, silently, forever (`checkpoint`'s
 own best-effort contract swallows the error).
 
-`run_git` neutralises repo-configured filter drivers before every
-invocation (`repo_program_overrides`) by querying `git config
---local`/`--worktree` for them first, with the same `cwd` and `envs` as the
-real invocation, so `GIT_DIR`/`GIT_WORK_TREE` are honoured exactly as git
-honours them. The query runs with `LC_ALL=C` so git's messages stay
-untranslated. Its outcome is read three ways: exit status 1 (no matching
-key) means a repository with no filters configured; git's "`<scope>` can only
-be used inside a git repository" message means there is no repository yet
-(the bootstrapping case, e.g. `GitCheckpointer::detect`'s first probe or
-`test_support::init_repo`'s `git init`), also benign; anything else (a
-malformed or unreadable local config, the query timing out) is a real
-failure and `run_git` returns it as an `Err` rather than running git without
-its filter overrides.
+### Repository state is not trusted (2026-10-28)
+
+All git here runs unconfined, and `.git` lies inside the directory a
+confined process may write — so its config, refs and paths must not steer
+that git. Two layers, both on every invocation:
+
+1. `repo_program_overrides` lists the config git will use (`git config
+   --list --includes --show-scope --show-origin -z`, same `cwd` and `envs`
+   as the real invocation, `LC_ALL=C`) and `check_repo_config` checks every
+   entry whose scope is the repository's (`local`, `worktree`, anything not
+   `system`/`global`/`command`) or whose file lies inside `cwd` against
+   `allowed_repo_setting`, an **allow-list**. Anything else is an `Err`
+   naming the keys (never values — an include can read any file). A failed
+   listing (malformed config, timeout) is an `Err` too. Outside any
+   repository the listing has only the user's config: the bootstrapping
+   case (`detect`, `init_repo`'s `git init`). Add to the allow-list only
+   settings that cannot run a program, move the work tree, read outside it
+   or reach a remote, for any command run through `run_git` or
+   `unconfined_git_args_blocking` (`gc.recentObjectsHook` is why `gc.*`
+   is not a wildcard).
+2. `SAFE_GIT_CONFIG` (`-c` fsmonitor/hooksPath/gpgSign off,
+   `protocol.allow=never`, `submodule.recurse=false`), `HARDENED_ENV`
+   (`GIT_NO_REPLACE_OBJECTS`, `GIT_NO_LAZY_FETCH`, `GIT_TERMINAL_PROMPT=0`)
+   and `repo_overrides`, which empties every program the repository's
+   own config names (filter and diff drivers, `diff.external`,
+   `gpg.program`) — those keys are allowed *only* because of this. This
+   is the older deny-list, kept under the allow-list; the
+   `without_the_allow_list_*` tests switch the allow-list off
+   (`ACCEPT_ANY_REPO_CONFIG`, test-only) to prove it holds alone.
+
+`GitCheckpointer` adds: `locate` (at `detect`) canonicalises the git dir,
+common dir and work tree, requires `cwd` inside the work tree and the git
+dir to be `<work tree>/.git` or a linked worktree whose `gitdir` points
+back; `git()` passes `GIT_DIR`/`GIT_WORK_TREE` explicitly; `check_layout`
+(before each operation, and again before `update-ref`) refuses symlinked
+or moved git/common dirs, symlinks at `aivyx/`, `objects/` and its fan-out
+dirs, `refs/aivyx/checkpoints/` and `logs/refs/aivyx/checkpoints/`, and
+`objects/info/alternates`. `private_index` creates `aivyx/` with mode 0700,
+requires the git dir's owner, and removes only a regular-file stale lock.
+The checks are re-run per call because the confined process can change
+`.git` between calls; a confined process still running *during* a
+checkpoint could race them (check-then-use), which is why the layer-2
+overrides stay.
+
+`unconfined_git_args_blocking` returns `Result`: an `Err` means don't run
+git at all.
 
 ## Where to look next
 
