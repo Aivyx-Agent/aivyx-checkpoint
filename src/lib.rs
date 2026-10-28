@@ -48,6 +48,20 @@ pub struct Checkpoint {
     pub tree: String,
 }
 
+/// What [`GitCheckpointer::detect_outcome`] found for a directory.
+pub enum DetectOutcome {
+    /// A git work tree that can be checkpointed safely.
+    Ready(GitCheckpointer),
+    /// Not inside a git work tree (or git couldn't be run at all).
+    NotARepo(String),
+    /// A git work tree, but checkpointing it would let the repository
+    /// steer this crate's unconfined git: its config holds a setting
+    /// outside the allow-list, or its layout is unsafe. The reason names
+    /// the setting or path (never a config value). Callers should tell the
+    /// user that undo and rollback are off for this repository.
+    Refused(String),
+}
+
 pub struct GitCheckpointer {
     cwd: PathBuf,
     /// `--absolute-git-dir`, resolved and canonicalised once at detection
@@ -89,9 +103,37 @@ impl GitCheckpointer {
     /// its git directory is neither `<work tree>/.git` nor a linked
     /// worktree of that work tree, or a path this crate writes under it is
     /// a symbolic link.
+    ///
+    /// Use [`Self::detect_outcome`] to tell a refused repository from a
+    /// directory that isn't one.
     pub async fn detect(cwd: &Path, deny_paths: Vec<PathBuf>) -> Option<Self> {
+        match Self::detect_outcome(cwd, deny_paths).await {
+            DetectOutcome::Ready(checkpointer) => Some(checkpointer),
+            DetectOutcome::NotARepo(reason) => {
+                tracing::info!(
+                    cwd = %cwd.display(),
+                    reason = %reason,
+                    "not a git repository — worktree checkpointing disabled"
+                );
+                None
+            }
+            DetectOutcome::Refused(reason) => {
+                tracing::warn!(
+                    cwd = %cwd.display(),
+                    reason = %reason,
+                    "git repository refused — worktree checkpointing disabled"
+                );
+                None
+            }
+        }
+    }
+
+    /// Like [`Self::detect`], but says why there is no checkpointer: not a
+    /// repository at all, or a repository this crate refuses to run
+    /// unconfined git in (see [`DetectOutcome::Refused`]). Logs nothing.
+    pub async fn detect_outcome(cwd: &Path, deny_paths: Vec<PathBuf>) -> DetectOutcome {
         match locate(cwd).await {
-            Ok((git_dir, common_dir, work_tree)) => Some(Self {
+            Ok((git_dir, common_dir, work_tree)) => DetectOutcome::Ready(Self {
                 cwd: cwd.to_path_buf(),
                 git_dir,
                 common_dir,
@@ -104,12 +146,11 @@ impl GitCheckpointer {
                 taken: Mutex::new(Vec::new()),
             }),
             Err(err) => {
-                tracing::info!(
-                    cwd = %cwd.display(),
-                    reason = %err,
-                    "no usable git repository — worktree checkpointing disabled"
-                );
-                None
+                if inside_a_work_tree(cwd).await {
+                    DetectOutcome::Refused(err)
+                } else {
+                    DetectOutcome::NotARepo(err)
+                }
             }
         }
     }
@@ -684,6 +725,35 @@ fn real_dir(path: &Path) -> Result<bool, String> {
     }
 }
 
+/// Whether `cwd` lies in a git work tree, asked *without* the config
+/// allow-list (that is what just refused it) but with every other
+/// protection: `SAFE_GIT_CONFIG`, `HARDENED_ENV`. `rev-parse
+/// --is-inside-work-tree` reads config and `.git` only; it runs no
+/// program and contacts no remote. A config git can't even parse is still
+/// a repository (`fatal: bad config ...`), so only git's own "not a git
+/// repository" answer, or no git at all, counts as "no".
+async fn inside_a_work_tree(cwd: &Path) -> bool {
+    let mut command = tokio::process::Command::new("git");
+    command
+        .args(SAFE_GIT_CONFIG)
+        .args(["rev-parse", "--is-inside-work-tree"])
+        .current_dir(cwd)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .envs(HARDENED_ENV)
+        .env("LC_ALL", "C")
+        .env("LANGUAGE", "");
+    let Ok(Ok(output)) = tokio::time::timeout(GIT_TIMEOUT, command.output()).await else {
+        return false;
+    };
+    if output.status.success() {
+        return String::from_utf8_lossy(&output.stdout).trim() == "true";
+    }
+    !String::from_utf8_lossy(&output.stderr).contains("not a git repository")
+}
+
 /// A full hexadecimal object id (SHA-1 or SHA-256), not an abbreviation.
 fn is_full_object_id(name: &str) -> bool {
     matches!(name.len(), 40 | 64) && name.bytes().all(|b| b.is_ascii_hexdigit())
@@ -909,6 +979,14 @@ fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
                 "hidedotfiles",
                 "fsmonitorhookversion",
                 "checkroundtripencoding",
+                // Read as ignore patterns / attributes by `add`, `ls-files`
+                // and `read-tree`: they decide which paths are skipped,
+                // never what is run, and their content is never stored. An
+                // attribute can only select a filter or diff driver, and
+                // the repository's own drivers are switched off; the user's
+                // own (global) drivers are trusted anyway.
+                "excludesfile",
+                "attributesfile",
             ]
             .contains(&name),
         },
@@ -931,12 +1009,23 @@ fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
             "gh-resolved",
         ]
         .contains(&name),
-        // Upstream tracking and editor bookkeeping only.
+        // Upstream tracking and editor bookkeeping only: read by porcelain
+        // (`pull`, `push`, `status`), none of which run a program from it.
         ("branch", Some(_)) => true,
+        // URL rewriting, used only when a transport is opened; every
+        // invocation here sets `protocol.allow=never` and
+        // `GIT_NO_LAZY_FETCH`, so no command reaches a remote at all.
+        ("url", Some(_)) => ["insteadof", "pushinsteadof"].contains(&name),
+        // Only `git help` and command-name typos read these; neither names
+        // a program (`help.browser` and `help.format` are left out).
+        ("help", None) => name == "autocorrect",
         ("user", None) => ["name", "email", "signingkey", "useconfigonly"].contains(&name),
         ("author" | "committer", None) => ["name", "email"].contains(&name),
         // Signing is always switched off by `SAFE_GIT_CONFIG`.
-        ("commit", None) => ["gpgsign", "verbose", "status", "cleanup"].contains(&name),
+        // `template` is a message file read only by porcelain `commit`
+        // without `-m`; it is text, never run, and the plumbing here
+        // (`commit-tree -m`) ignores it.
+        ("commit", None) => ["gpgsign", "verbose", "status", "cleanup", "template"].contains(&name),
         ("tag", None) => ["gpgsign", "sort"].contains(&name),
         // Programs switched off by [`repo_overrides`]; signing is off anyway.
         ("gpg", None) => ["format", "program"].contains(&name),
@@ -956,10 +1045,28 @@ fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
         ]
         .contains(&name),
         ("pull", None) => ["rebase", "ff"].contains(&name),
-        ("push", None) => ["default", "autosetupremote", "followtags"].contains(&name),
-        ("fetch", None) => ["prune", "prunetags"].contains(&name),
+        // Push-only options; nothing here pushes (`protocol.allow=never`).
+        ("push", None) => [
+            "default",
+            "autosetupremote",
+            "followtags",
+            "recursesubmodules",
+        ]
+        .contains(&name),
+        // Fetch-only options; nothing here fetches (`protocol.allow=never`).
+        ("fetch", None) => [
+            "prune",
+            "prunetags",
+            "recursesubmodules",
+            "writecommitgraph",
+            "parallel",
+            "fsckobjects",
+        ]
+        .contains(&name),
         ("rebase", None) => ["autosquash", "autostash", "updaterefs"].contains(&name),
-        ("merge", None) => ["ff", "conflictstyle"].contains(&name),
+        // Porcelain merge options; `merge.<driver>.driver` (a program) has a
+        // subsection and stays refused.
+        ("merge", None) => ["ff", "conflictstyle", "log", "stat", "autostash"].contains(&name),
         ("diff", None) => [
             "renames",
             "algorithm",
@@ -992,7 +1099,20 @@ fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
             "aheadbehind",
         ]
         .contains(&name),
-        ("log", None) => ["decorate", "date", "follow", "abbrevcommit"].contains(&name),
+        // Output formatting for `log`; `showsignature` (runs the signing
+        // program) is left out.
+        ("log", None) => [
+            "decorate",
+            "date",
+            "follow",
+            "abbrevcommit",
+            "showroot",
+            "mailmap",
+            "graphcolors",
+            "excludedecoration",
+            "diffmerges",
+        ]
+        .contains(&name),
         ("color" | "advice", _) => true,
         ("gui", None) => ["wmstate", "geometry"].contains(&name),
         ("i18n", None) => ["commitencoding", "logoutputencoding"].contains(&name),
@@ -2653,7 +2773,6 @@ mod tests {
             ("core.repositoryformatversion", Some("SECRET-VALUE")),
             ("core.pager", Some("SECRET-VALUE")),
             ("core.editor", Some("SECRET-VALUE")),
-            ("core.excludesfile", Some("SECRET-VALUE")),
             ("core.alternaterefscommand", Some("SECRET-VALUE")),
             ("extensions.partialclone", Some("SECRET-VALUE")),
             ("remote.origin.promisor", Some("SECRET-VALUE")),
@@ -2741,6 +2860,97 @@ mod tests {
         assert!(diff.contains("+v2"), "{diff}");
         assert!(!ext.exists(), "a repo external diff ran unconfined");
         assert!(!conv.exists(), "a repo textconv ran unconfined");
+    }
+
+    #[tokio::test]
+    async fn a_repository_with_common_everyday_settings_still_checkpoints() {
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        let cwd = dir.path().canonicalize().unwrap();
+        for (key, value) in [
+            ("commit.template", "/nonexistent/template"),
+            ("core.excludesFile", "/nonexistent/ignore"),
+            ("core.attributesFile", "/nonexistent/attributes"),
+            ("user.name", "someone"),
+            ("i18n.commitEncoding", "UTF-8"),
+            ("init.defaultBranch", "main"),
+            ("pull.rebase", "true"),
+            ("push.autoSetupRemote", "true"),
+            ("fetch.prune", "true"),
+            ("branch.main.remote", "origin"),
+            ("branch.main.merge", "refs/heads/main"),
+            ("branch.main.rebase", "true"),
+            ("remote.origin.url", "git@github.com:a/b.git"),
+            ("remote.origin.fetch", "+refs/heads/*:refs/remotes/origin/*"),
+            ("remote.origin.pushurl", "git@github.com:a/b.git"),
+            ("url.git@github.com:.insteadOf", "https://github.com/"),
+            ("color.ui", "auto"),
+            ("log.showRoot", "true"),
+            ("status.short", "true"),
+            ("rerere.enabled", "true"),
+            ("merge.conflictStyle", "zdiff3"),
+            ("help.autocorrect", "prompt"),
+        ] {
+            plain_git(&cwd, &["config", key, value]);
+        }
+        std::fs::write(cwd.join("tracked.txt"), "v2\n").unwrap();
+        let cp = GitCheckpointer::detect(&cwd, vec![]).await.unwrap();
+        let cancel = CancellationToken::new();
+        cp.try_checkpoint("write_file", &cancel).await.unwrap();
+        let good = cp.latest_ref(&cancel).await.unwrap();
+        std::fs::write(cwd.join("tracked.txt"), "v3\n").unwrap();
+        cp.restore_to(&good, &cancel).await.unwrap();
+        assert_eq!(
+            std::fs::read_to_string(cwd.join("tracked.txt")).unwrap(),
+            "v2\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn detect_outcome_tells_a_refused_repository_from_no_repository() {
+        let plain = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            GitCheckpointer::detect_outcome(plain.path(), vec![]).await,
+            DetectOutcome::NotARepo(_)
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        init_repo(dir.path()).await;
+        assert!(matches!(
+            GitCheckpointer::detect_outcome(dir.path(), vec![]).await,
+            DetectOutcome::Ready(_)
+        ));
+        plain_git(dir.path(), &["config", "core.sshCommand", "SECRET-VALUE"]);
+        match GitCheckpointer::detect_outcome(dir.path(), vec![]).await {
+            DetectOutcome::Refused(reason) => {
+                assert!(reason.contains("core.sshcommand"), "{reason}");
+                assert!(!reason.contains("SECRET-VALUE"), "{reason}");
+            }
+            _ => panic!("expected Refused"),
+        }
+        // From a subdirectory too, and for an unsafe layout.
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        assert!(matches!(
+            GitCheckpointer::detect_outcome(&dir.path().join("sub"), vec![]).await,
+            DetectOutcome::Refused(_)
+        ));
+        plain_git(dir.path(), &["config", "--unset", "core.sshCommand"]);
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join(".git/aivyx")).unwrap();
+        assert!(matches!(
+            GitCheckpointer::detect_outcome(dir.path(), vec![]).await,
+            DetectOutcome::Refused(_)
+        ));
+        // A config git can't parse is still a repository.
+        std::fs::remove_file(dir.path().join(".git/aivyx")).unwrap();
+        let config = dir.path().join(".git/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("[bad\n");
+        std::fs::write(&config, text).unwrap();
+        assert!(matches!(
+            GitCheckpointer::detect_outcome(dir.path(), vec![]).await,
+            DetectOutcome::Refused(_)
+        ));
     }
 
     #[tokio::test]

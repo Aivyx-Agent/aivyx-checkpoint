@@ -156,6 +156,11 @@ The checks are re-run per call because the confined process can change
 checkpoint could race them (check-then-use), which is why the layer-2
 overrides stay.
 
+`detect_outcome` returns `DetectOutcome::{Ready, NotARepo, Refused}`; it
+tells the two failures apart with an allow-list-free (but otherwise
+hardened) `rev-parse --is-inside-work-tree`. `detect` wraps it (info log
+for NotARepo, warn for Refused).
+
 `unconfined_git_args_blocking` returns `Result`: an `Err` means don't run
 git at all.
 

@@ -47,7 +47,10 @@ user identity, line-ending and index options, LFS and sparse-checkout
 bookkeeping and the like. Anything else (a setting that can run a program,
 move the work tree or reach a remote, an include, an unknown extension)
 makes `run_git` and `unconfined_git_args_blocking` return an error naming
-the setting, and `detect` return `None`; checkpoints resume once the
+the setting, and `detect` return `None` (`detect_outcome` returns
+`DetectOutcome::Refused(reason)` instead, so a caller can tell the user that
+undo is off for this repository, rather than treating it as "not a git
+repository"); checkpoints resume once the
 setting is removed. The check runs before every git invocation. As a
 second layer, every invocation switches off fsmonitor, hooks, signing,
 network transport and submodule recursion, ignores replace refs, disables
