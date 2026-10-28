@@ -59,3 +59,11 @@ allow = [
 # (all-features) is green with no exceptions -- verified directly
 # against this exact allow-list before this file was committed. Any
 # future copyleft dep now fails the gate loudly.
+
+[advisories]
+version = 2
+# New advisories fail CI. Unmaintained crates are reported too, so they
+# surface; accepted ones go in `ignore` with the reason.
+yanked = "deny"
+unmaintained = "all"
+ignore = []
