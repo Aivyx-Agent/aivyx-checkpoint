@@ -741,7 +741,9 @@ async fn inside_a_work_tree(cwd: &Path) -> bool {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
+        .kill_on_drop(true);
+    scrub_git_env(&mut command);
+    command
         .envs(HARDENED_ENV)
         .env("LC_ALL", "C")
         .env("LANGUAGE", "");
@@ -889,6 +891,49 @@ const HARDENED_ENV: [(&str, &str); 3] = [
     ("GIT_NO_LAZY_FETCH", "1"),
     ("GIT_TERMINAL_PROMPT", "0"),
 ];
+
+/// Variables git honours that would inject config, an external program or
+/// extra objects. Removed from the environment of every git this crate
+/// runs (the caller's `envs` are applied afterwards and may set what they
+/// need).
+const SCRUBBED_ENV: [&str; 9] = [
+    "GIT_EXTERNAL_DIFF",
+    "GIT_CONFIG_COUNT",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_PROXY_COMMAND",
+    "GIT_SSH",
+    "GIT_SSH_COMMAND",
+    "GIT_ASKPASS",
+    "SSH_ASKPASS",
+];
+
+/// Names to remove from a git's environment: [`SCRUBBED_ENV`] plus every
+/// `GIT_CONFIG_KEY_<n>` / `GIT_CONFIG_VALUE_<n>` among `present`.
+fn scrubbed_env_names<I: IntoIterator<Item = std::ffi::OsString>>(
+    present: I,
+) -> Vec<std::ffi::OsString> {
+    let mut names: Vec<std::ffi::OsString> = SCRUBBED_ENV.iter().map(Into::into).collect();
+    for name in present {
+        let text = name.to_string_lossy();
+        if text.starts_with("GIT_CONFIG_KEY_") || text.starts_with("GIT_CONFIG_VALUE_") {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+fn scrub_git_env(command: &mut tokio::process::Command) {
+    for name in scrubbed_env_names(std::env::vars_os().map(|(k, _)| k)) {
+        command.env_remove(name);
+    }
+}
+
+fn scrub_git_env_blocking(command: &mut std::process::Command) {
+    for name in scrubbed_env_names(std::env::vars_os().map(|(k, _)| k)) {
+        command.env_remove(name);
+    }
+}
 
 /// Lists every config entry git will use, with its scope and origin, so
 /// [`check_repo_config`] can tell the repository's own entries (which a
@@ -1161,6 +1206,38 @@ fn allowed_repo_setting(key: &str, value: Option<&str>) -> bool {
     }
 }
 
+/// A config key as it may appear in a message: a subsection (a remote or
+/// URL name, which can carry credentials, as in
+/// `credential.https://user:SECRET@host.helper`) is replaced by
+/// `<redacted>`.
+fn redact_key(key: &str) -> String {
+    match (key.split_once('.'), key.rsplit_once('.')) {
+        (Some((section, _)), Some((_, name))) if key.matches('.').count() >= 2 => {
+            format!("{section}.<redacted>.{name}")
+        }
+        _ => key.to_string(),
+    }
+}
+
+/// True for `core.excludesFile` / `core.attributesFile` naming something
+/// that exists and is not a regular file. git opens it for reading, so a
+/// FIFO planted by a confined process would hang every git until the
+/// timeout (and a device or directory is no ignore file either).
+fn names_a_non_regular_file(key: &str, value: &str, cwd: &Path) -> bool {
+    if !matches!(key, "core.excludesfile" | "core.attributesfile") {
+        return false;
+    }
+    let path = match value.strip_prefix("~/") {
+        Some(rest) => match std::env::var_os("HOME") {
+            Some(home) => Path::new(&home).join(rest),
+            None => return false,
+        },
+        None => cwd.join(value),
+    };
+    // `metadata` follows symlinks, as git's open does; it never blocks.
+    std::fs::metadata(path).is_ok_and(|m| !m.is_file())
+}
+
 /// Checks a [`CONFIG_LISTING`] of the config git will use in `cwd`, and
 /// returns the `-c` overrides switching off every program the
 /// repository's own config names (see [`repo_overrides`]).
@@ -1204,8 +1281,11 @@ fn check_repo_config(listing: &[u8], cwd: &Path) -> Result<Vec<String>, String> 
         if ACCEPT_ANY_REPO_CONFIG.with(std::cell::Cell::get) {
             continue;
         }
-        if !allowed_repo_setting(key, value) && !refused.iter().any(|k| k == key) {
-            refused.push(key.to_string());
+        let unusable = !allowed_repo_setting(key, value)
+            || value.is_some_and(|v| names_a_non_regular_file(key, v, cwd));
+        let shown = redact_key(key);
+        if unusable && !refused.contains(&shown) {
+            refused.push(shown);
         }
     }
     if refused.is_empty() {
@@ -1283,8 +1363,9 @@ async fn repo_program_overrides(cwd: &Path, envs: &[(&str, &str)]) -> Result<Vec
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .envs(HARDENED_ENV);
+        .kill_on_drop(true);
+    scrub_git_env(&mut command);
+    command.envs(HARDENED_ENV);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -1316,7 +1397,9 @@ pub fn unconfined_git_args_blocking(cwd: &Path) -> Result<Vec<String>, String> {
     command
         .args(CONFIG_LISTING)
         .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    scrub_git_env_blocking(&mut command);
+    command
         .envs(HARDENED_ENV)
         .env("LC_ALL", "C")
         .env("LANGUAGE", "");
@@ -1418,8 +1501,9 @@ pub async fn run_git(cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Result
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .kill_on_drop(true)
-        .envs(HARDENED_ENV);
+        .kill_on_drop(true);
+    scrub_git_env(&mut command);
+    command.envs(HARDENED_ENV);
     for (key, value) in envs {
         command.env(key, value);
     }
@@ -2764,6 +2848,84 @@ mod tests {
     }
 
     #[test]
+    fn a_refusal_never_shows_a_subsection_that_could_hold_a_secret() {
+        for key in [
+            "credential.https://user:HUNTER2@example.com.helper",
+            "http.https://user:HUNTER2@example.com/.extraheader",
+            "url.https://user:HUNTER2@example.com/.insteadof2",
+        ] {
+            let listed = listing(&[("local", "file:.git/config", key, Some("v"))]);
+            let err = check_repo_config(&listed, Path::new("/repo")).unwrap_err();
+            assert!(!err.contains("HUNTER2"), "{key}: {err}");
+        }
+        assert_eq!(redact_key("core.pager"), "core.pager");
+        assert_eq!(redact_key("merge.evil.driver"), "merge.<redacted>.driver");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_excludes_or_attributes_file_that_is_not_a_regular_file_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path();
+        let fifo = cwd.join("pipe");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&fifo)
+                .status()
+                .unwrap()
+                .success()
+        );
+        std::fs::write(cwd.join("ignore"), "x\n").unwrap();
+        for key in ["core.excludesfile", "core.attributesfile"] {
+            let listed = listing(&[("local", "file:.git/config", key, Some("pipe"))]);
+            assert!(check_repo_config(&listed, cwd).is_err(), "{key}");
+            let listed = listing(&[("local", "file:.git/config", key, Some("ignore"))]);
+            assert!(check_repo_config(&listed, cwd).is_ok(), "{key}");
+            let listed = listing(&[("local", "file:.git/config", key, Some("missing"))]);
+            assert!(check_repo_config(&listed, cwd).is_ok(), "{key}");
+        }
+    }
+
+    #[test]
+    fn git_runs_with_config_and_program_injection_variables_removed() {
+        let names = scrubbed_env_names(
+            [
+                "PATH",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+                "GIT_CONFIG_GLOBAL",
+            ]
+            .map(std::ffi::OsString::from),
+        );
+        for must in [
+            "GIT_EXTERNAL_DIFF",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_PARAMETERS",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_PROXY_COMMAND",
+            "GIT_SSH",
+            "GIT_SSH_COMMAND",
+            "GIT_ASKPASS",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_VALUE_0",
+        ] {
+            assert!(names.iter().any(|n| n == must), "{must} not scrubbed");
+        }
+        assert!(
+            !names
+                .iter()
+                .any(|n| n == "PATH" || n == "GIT_CONFIG_GLOBAL")
+        );
+        let mut command = std::process::Command::new("git");
+        scrub_git_env_blocking(&mut command);
+        assert!(
+            command
+                .get_envs()
+                .any(|(k, v)| k == "GIT_SSH_COMMAND" && v.is_none())
+        );
+    }
+
+    #[test]
     fn settings_outside_the_allow_list_are_refused_by_name_only() {
         for (key, value) in [
             ("core.sshcommand", Some("SECRET-VALUE")),
@@ -2793,7 +2955,7 @@ mod tests {
         ] {
             let listed = listing(&[("local", "file:.git/config", key, value)]);
             let err = check_repo_config(&listed, Path::new("/repo")).unwrap_err();
-            assert!(err.contains(key), "{key}: {err}");
+            assert!(err.contains(&redact_key(key)), "{key}: {err}");
             if value.is_some() {
                 assert!(
                     !err.contains("SECRET-VALUE"),
